@@ -37,7 +37,9 @@ async def request(method: str, params: dict[str, Any]) -> Envelope:
     try:
         reader, writer = await asyncio.open_unix_connection(str(socket_path()))
     except OSError:
-        subprocess.run(["systemctl", "--user", "start", "browser-proxy.socket"], check=False)
+        await asyncio.to_thread(
+            subprocess.run, ["systemctl", "--user", "start", "browser-proxy.service"], check=False
+        )
         for _ in range(30):
             await asyncio.sleep(0.1)
             try:

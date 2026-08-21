@@ -185,10 +185,10 @@ def _systemctl(*arguments: str) -> Envelope:
 
 @admin_app.command("install")
 def admin_install() -> None:
-    """Purpose: link repository-owned units and enable the user socket.
+    """Purpose: link and enable the repository-owned singleton user service.
 
     Args:
-        None: Uses the repository-relative service and socket unit files.
+        None: Uses the repository-relative service unit file.
 
     Returns:
         None: Emits one stable systemd result envelope.
@@ -200,13 +200,10 @@ def admin_install() -> None:
         'admin_install'
     """
     project = Path(__file__).resolve().parents[2]
-    service, unit_socket = (
-        project / "systemd/browser-proxy.service",
-        project / "systemd/browser-proxy.socket",
-    )
-    result = _systemctl("link", str(service), str(unit_socket))
+    service = project / "systemd/browser-proxy.service"
+    result = _systemctl("link", str(service))
     if result.meta.status == "ok":
-        result = _systemctl("enable", "--now", "browser-proxy.socket")
+        result = _systemctl("enable", "browser-proxy.service")
     _emit(result, None)
 
 

@@ -111,7 +111,6 @@ async def _profile_list(payload: dict[str, Any], context: DaemonContext) -> dict
     }
 
 
-@require_approval
 async def _profile_start(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: start a persistent Microsoft Edge profile with a private CDP endpoint.
 

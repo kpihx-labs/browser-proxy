@@ -252,7 +252,9 @@ class Daemon:
             if process.poll() is not None:
                 self._processes.pop(name, None)
                 stderr = process.stderr.read().decode() if process.stderr else "no stderr"
-                raise RuntimeError(f"PROFILE_UNAVAILABLE: Microsoft Edge exited before CDP became ready. Stderr: {stderr}")
+                raise RuntimeError(
+                    f"PROFILE_UNAVAILABLE: Microsoft Edge exited before CDP became ready. Stderr: {stderr}"
+                )
             try:
                 await CdpBrowser(port).call("Browser.getVersion", {})
             except RuntimeError:
