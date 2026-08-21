@@ -1,0 +1,11 @@
+[Unit]
+Description=Browser Proxy Unix socket
+
+[Socket]
+ListenStream=%t/browser-proxy/browser-proxy.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+
+[Install]
+WantedBy=sockets.target

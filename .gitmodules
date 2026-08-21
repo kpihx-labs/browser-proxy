@@ -1,0 +1,3 @@
+[submodule "browser-proxy-ext"]
+	path = browser-proxy-ext
+	url = git@github.com:kpihx-labs/browser-proxy-ext.git
