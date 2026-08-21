@@ -21,7 +21,20 @@ class ExtensionBridge:
     _pending: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
 
     def pair(self) -> None:
-        """Create a fresh protected pairing capability without exposing it in output."""
+        """Purpose: create a protected pairing capability without exposing it in output.
+
+        Args:
+            self (ExtensionBridge): Bridge whose private runtime capability is rotated.
+
+        Returns:
+            None: Persists a newly generated mode-0600 local capability.
+
+        Examples:
+            >>> callable(ExtensionBridge.pair)
+            True
+            >>> ExtensionBridge(timeout_seconds=1).timeout_seconds
+            1
+        """
 
         runtime_dir().mkdir(parents=True, exist_ok=True)
         path = pairing_token_path()
@@ -29,19 +42,59 @@ class ExtensionBridge:
         path.chmod(0o600)
 
     def _token(self) -> str:
+        """Purpose: load or initialize the private extension pairing capability.
+
+        Args:
+            self (ExtensionBridge): Bridge whose private token path is consulted.
+
+        Returns:
+            str: Non-empty local capability used only for constant-time comparison.
+
+        Examples:
+            >>> callable(ExtensionBridge._token)
+            True
+            >>> ExtensionBridge()._server is None
+            True
+        """
         path = pairing_token_path()
         if not path.exists():
             self.pair()
         return path.read_text(encoding="utf-8").strip()
 
     async def start(self) -> None:
-        """Start the private loopback bridge once per daemon."""
+        """Purpose: start the private loopback bridge once per daemon.
+
+        Args:
+            self (ExtensionBridge): Bridge that opens the loopback WebSocket server.
+
+        Returns:
+            None: Leaves an existing server untouched or starts a new one.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ExtensionBridge.start)
+            True
+            >>> ExtensionBridge().connected
+            False
+        """
 
         if self._server is None:
             self._server = await serve(self._handle, "127.0.0.1", extension_port())
 
     async def stop(self) -> None:
-        """Stop the bridge and fail pending extension operations."""
+        """Purpose: stop the bridge and fail pending extension operations.
+
+        Args:
+            self (ExtensionBridge): Bridge whose server and pending requests are closed.
+
+        Returns:
+            None: Completes outstanding requests with ``EXTENSION_UNAVAILABLE``.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ExtensionBridge.stop)
+            True
+            >>> ExtensionBridge()._pending == {}
+            True
+        """
 
         if self._server is not None:
             self._server.close()
@@ -55,13 +108,39 @@ class ExtensionBridge:
 
     @property
     def connected(self) -> bool:
-        """Whether an authenticated extension is currently connected."""
+        """Purpose: report whether an authenticated extension is currently connected.
+
+        Args:
+            self (ExtensionBridge): Bridge whose active WebSocket is inspected.
+
+        Returns:
+            bool: ``True`` only while an authenticated extension connection exists.
+
+        Examples:
+            >>> ExtensionBridge().connected
+            False
+            >>> isinstance(ExtensionBridge().connected, bool)
+            True
+        """
 
         return self._connection is not None
 
     @property
     def port(self) -> int:
-        """Return the actual bound loopback port, including port-zero test allocation."""
+        """Purpose: return the actual bound loopback port, including test allocation.
+
+        Args:
+            self (ExtensionBridge): Bridge whose bound server socket is inspected.
+
+        Returns:
+            int: Bound port or configured port before the server starts.
+
+        Examples:
+            >>> isinstance(ExtensionBridge().port, int)
+            True
+            >>> ExtensionBridge().port > 0
+            True
+        """
 
         if self._server is None or not self._server.sockets:
             return extension_port()
@@ -69,7 +148,22 @@ class ExtensionBridge:
         return int(address[1])
 
     async def request(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch a typed request to the paired extension and await its response."""
+        """Purpose: dispatch a typed request to the paired extension and await its reply.
+
+        Args:
+            self (ExtensionBridge): Authenticated bridge that sends the request.
+            kind (str): Typed extension operation such as ``bookmark.list``.
+            payload (dict[str, Any]): Complete single action object to forward unchanged.
+
+        Returns:
+            dict[str, Any]: Typed extension reply with ``ok`` and object-valued ``data``.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ExtensionBridge.request)
+            True
+            >>> ExtensionBridge(timeout_seconds=2).timeout_seconds
+            2
+        """
 
         if self._connection is None:
             raise RuntimeError("EXTENSION_UNAVAILABLE")
@@ -85,7 +179,21 @@ class ExtensionBridge:
             self._pending.pop(request_id, None)
 
     async def _handle(self, connection: ServerConnection) -> None:
-        """Authenticate one extension then route its typed responses."""
+        """Purpose: authenticate one extension and route its typed responses.
+
+        Args:
+            self (ExtensionBridge): Bridge storing the authenticated connection.
+            connection (ServerConnection): Newly accepted loopback WebSocket connection.
+
+        Returns:
+            None: Closes malformed connections and resolves matching pending requests.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ExtensionBridge._handle)
+            True
+            >>> callable(ExtensionBridge._handle)
+            True
+        """
 
         try:
             raw = await asyncio.wait_for(connection.recv(), timeout=10)

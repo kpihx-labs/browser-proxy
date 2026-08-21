@@ -31,10 +31,10 @@ READ_ONLY_METHODS = frozenset(
 
 
 def is_read_only_method(method: str) -> bool:
-    """Return whether a raw CDP method belongs to the conservative read-only allowlist.
+    """Purpose: identify conservative read-only raw CDP methods.
 
     Args:
-        method: Browser-level CDP method name.
+        method (str): Browser-level CDP method name.
 
     Returns:
         ``True`` only for methods known to have no browser mutation.
@@ -72,7 +72,7 @@ class CdpBrowser:
     _next_id: int = 0
 
     async def _browser_ws_url(self) -> str:
-        """Read Edge's browser-level debugger WebSocket URL.
+        """Purpose: read Edge's browser-level debugger WebSocket URL.
 
         Args:
             None.
@@ -100,11 +100,11 @@ class CdpBrowser:
         return endpoint
 
     async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Issue one browser-level CDP method and return its result object.
+        """Purpose: issue one browser-level CDP method and return its result object.
 
         Args:
-            method: Fully qualified CDP method, such as ``Target.getTargets``.
-            params: JSON object accepted by that CDP method.
+        method (str): Fully qualified CDP method, such as ``Target.getTargets``.
+        params (dict[str, Any]): JSON object accepted by that CDP method.
 
         Returns:
             The CDP ``result`` object.
@@ -133,7 +133,20 @@ class CdpBrowser:
         raise RuntimeError("CDP_UNAVAILABLE: connection closed")
 
     async def targets(self) -> list[dict[str, Any]]:
-        """Return inspectable page targets for this Edge profile."""
+        """Purpose: return inspectable CDP targets for this Edge profile.
+
+        Args:
+            self (CdpBrowser): Client bound to one managed Edge debugging port.
+
+        Returns:
+            list[dict[str, Any]]: Object-valued entries from ``Target.getTargets``.
+
+        Examples:
+            >>> CdpBrowser(9222).port
+            9222
+            >>> asyncio.iscoroutinefunction(CdpBrowser.targets)
+            True
+        """
 
         result = await self.call("Target.getTargets", {})
         infos = result.get("targetInfos", [])
@@ -144,7 +157,23 @@ class CdpBrowser:
     async def page_call(
         self, target_id: str, method: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Call a page-scoped CDP method through a short-lived flattened session."""
+        """Purpose: call a page-scoped CDP method through a flattened session.
+
+        Args:
+            self (CdpBrowser): Client bound to one managed Edge debugging port.
+            target_id (str): CDP page target receiving the method.
+            method (str): Page-scoped CDP method such as ``Page.getNavigationHistory``.
+            params (dict[str, Any]): Object-valued parameters accepted by the method.
+
+        Returns:
+            dict[str, Any]: Result object returned by the detached page session.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(CdpBrowser.page_call)
+            True
+            >>> CdpBrowser(9222)._next_id
+            0
+        """
 
         attached = await self.call(
             "Target.attachToTarget", {"targetId": target_id, "flatten": True}
@@ -165,10 +194,10 @@ class CdpBrowser:
 
 
 async def _messages(websocket: Any) -> AsyncIterator[str]:
-    """Yield text frames from a WebSocket with an explicit narrow type boundary.
+    """Purpose: yield text frames from a WebSocket at a narrow type boundary.
 
     Args:
-        websocket: A connected ``websockets`` client protocol.
+        websocket (Any): A connected ``websockets`` client protocol.
 
     Returns:
         An async iterator of CDP JSON frames.

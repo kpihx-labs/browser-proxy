@@ -18,11 +18,11 @@ from browser_proxy.paths import socket_path
 
 
 async def request(method: str, params: dict[str, Any]) -> Envelope:
-    """Send one request to the socket-activated daemon and parse its envelope.
+    """Purpose: send one request to the socket-activated daemon and parse its envelope.
 
     Args:
-        method: Daemon method name.
-        params: JSON object for that method.
+        method (str): Daemon method name.
+        params (dict[str, Any]): JSON object for that method.
 
     Returns:
         The daemon's validated response envelope.

@@ -39,11 +39,11 @@ class Policy:
 
 
 def _with_policy(handler: F, policy: Policy) -> F:
-    """Attach policy metadata without wrapping or changing a handler signature.
+    """Purpose: attach policy metadata without changing a handler signature.
 
     Args:
-        handler: Action implementation receiving a validated payload.
-        policy: Complete immutable policy to attach.
+        handler (F): Action implementation receiving a validated payload.
+        policy (Policy): Complete immutable policy to attach.
 
     Returns:
         The original handler with ``__browser_policy__`` metadata.
@@ -59,10 +59,10 @@ def _with_policy(handler: F, policy: Policy) -> F:
 
 
 def policy_of(handler: Callable[..., Any]) -> Policy:
-    """Read existing metadata or return the safe default policy.
+    """Purpose: read existing metadata or return the safe default policy.
 
     Args:
-        handler: Action function whose metadata is inspected.
+        handler (Callable[..., Any]): Action function whose metadata is inspected.
 
     Returns:
         Existing policy or an empty policy.
@@ -78,10 +78,10 @@ def policy_of(handler: Callable[..., Any]) -> Policy:
 
 
 def require_approval(handler: F) -> F:
-    """Mark an action as requiring an extension-mediated human decision.
+    """Purpose: mark an action as requiring an extension-mediated human decision.
 
     Args:
-        handler: Action implementation to protect.
+        handler (F): Action implementation to protect.
 
     Returns:
         The same handler annotated with an approval policy.
@@ -97,10 +97,10 @@ def require_approval(handler: F) -> F:
 
 
 def require_preflight(*identity_fields: str) -> Callable[[F], F]:
-    """Protect mutation identity by declaring fields the daemon must preflight.
+    """Purpose: protect mutation identity with daemon preflight fields.
 
     Args:
-        identity_fields: Payload names identifying an existing browser resource.
+        identity_fields (str): Payload names identifying an existing browser resource.
 
     Returns:
         A decorator that adds immutable identity requirements.
@@ -113,16 +113,30 @@ def require_preflight(*identity_fields: str) -> Callable[[F], F]:
     """
 
     def decorate(handler: F) -> F:
+        """Purpose: apply the declared immutable preflight fields to one handler.
+
+        Args:
+            handler (F): Action implementation receiving the augmented policy.
+
+        Returns:
+            F: The same handler with immutable preflight metadata.
+
+        Examples:
+            >>> decorate(lambda: None).__browser_policy__.preflight_fields
+            identity_fields
+            >>> callable(decorate)
+            True
+        """
         return _with_policy(handler, replace(policy_of(handler), preflight_fields=identity_fields))
 
     return decorate
 
 
 def require_verification(*fields: str) -> Callable[[F], F]:
-    """Require post-action read-back checks for declared result fields.
+    """Purpose: require post-action read-back checks for declared result fields.
 
     Args:
-        fields: Expected payload/result fields to validate after a mutation.
+        fields (str): Expected payload/result fields to validate after a mutation.
 
     Returns:
         A decorator that adds verification requirements.
@@ -135,6 +149,20 @@ def require_verification(*fields: str) -> Callable[[F], F]:
     """
 
     def decorate(handler: F) -> F:
+        """Purpose: apply the declared verification fields to one handler.
+
+        Args:
+            handler (F): Action implementation receiving the augmented policy.
+
+        Returns:
+            F: The same handler with verification metadata.
+
+        Examples:
+            >>> decorate(lambda: None).__browser_policy__.verification
+            fields
+            >>> callable(decorate)
+            True
+        """
         return _with_policy(handler, replace(policy_of(handler), verification=fields))
 
     return decorate

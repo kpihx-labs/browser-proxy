@@ -32,10 +32,10 @@ app.add_typer(admin_app, name="admin")
 
 
 def _payload(value: str) -> dict[str, object]:
-    """Parse one inline JSON object or a path to one JSON object.
+    """Purpose: parse one inline JSON object or a path to one JSON object.
 
     Args:
-        value: JSON text or a path to a JSON file.
+        value (str): JSON text or a path to a JSON file.
 
     Returns:
         A validated top-level JSON object.
@@ -55,11 +55,12 @@ def _payload(value: str) -> dict[str, object]:
 
 
 def _emit(envelope: Envelope, output: Path | None, output_format: str = "json") -> None:
-    """Print one complete proxy envelope and optionally persist the same JSON.
+    """Purpose: print one complete proxy envelope and optionally persist the same JSON.
 
     Args:
-        envelope: Pydantic proxy envelope returned by the daemon.
-        output: Optional requested output path.
+        envelope (Envelope): Pydantic proxy envelope returned by the daemon.
+        output (Path | None): Optional requested output path.
+        output_format (str): Presentation mode, either ``json`` or ``table``.
 
     Returns:
         ``None`` after JSON-only stdout output.
@@ -84,7 +85,7 @@ def _emit(envelope: Envelope, output: Path | None, output_format: str = "json") 
 
 @do_app.callback(invoke_without_command=True)
 def do_help() -> None:
-    """Display registry-backed grouped action names.
+    """Purpose: display registry-backed grouped action names.
 
     Args:
         None.
@@ -108,12 +109,13 @@ for _name, _action in REGISTRY.items():
         output_format: Annotated[str, typer.Option("-f", help="json or table")] = "json",
         _action_name: str = _name,
     ) -> None:
-        """Dispatch one documented registry action using one JSON payload.
+        """Purpose: dispatch one documented registry action using one JSON payload.
 
         Args:
-            payload: Inline JSON object or JSON file path.
-            output: Optional file that receives the full result envelope.
-            _action_name: Bound registry name.
+            payload (str): Inline JSON object or JSON file path.
+            output (Path | None): Optional file that receives the full result envelope.
+            output_format (str): Presentation mode, either ``json`` or ``table``.
+            _action_name (str): Bound registry name.
 
         Returns:
             ``None`` after printing the JSON envelope.
@@ -138,7 +140,7 @@ for _name, _action in REGISTRY.items():
 
 @admin_app.command("status")
 def admin_status() -> None:
-    """Report daemon-owned Edge profile endpoints.
+    """Purpose: report daemon-owned Edge profile endpoints.
 
     Args:
         None.
@@ -157,7 +159,20 @@ def admin_status() -> None:
 
 
 def _systemctl(*arguments: str) -> Envelope:
-    """Run a non-interactive user-systemd operation and return a stable envelope."""
+    """Purpose: run a non-interactive user-systemd operation.
+
+    Args:
+        arguments (str): User-systemd arguments, for example ``start`` and a unit name.
+
+    Returns:
+        Envelope: Stable success or failure envelope for the systemd invocation.
+
+    Examples:
+        >>> callable(_systemctl)
+        True
+        >>> isinstance(_systemctl.__name__, str)
+        True
+    """
     completed = subprocess.run(
         ["systemctl", "--user", *arguments], capture_output=True, text=True, check=False
     )
@@ -170,7 +185,20 @@ def _systemctl(*arguments: str) -> Envelope:
 
 @admin_app.command("install")
 def admin_install() -> None:
-    """Link the repository-owned user service and socket units, then enable the socket."""
+    """Purpose: link repository-owned units and enable the user socket.
+
+    Args:
+        None: Uses the repository-relative service and socket unit files.
+
+    Returns:
+        None: Emits one stable systemd result envelope.
+
+    Examples:
+        >>> callable(admin_install)
+        True
+        >>> admin_install.__name__
+        'admin_install'
+    """
     project = Path(__file__).resolve().parents[2]
     service, unit_socket = (
         project / "systemd/browser-proxy.service",
@@ -184,7 +212,20 @@ def admin_install() -> None:
 
 @admin_app.command("start")
 def admin_start() -> None:
-    """Enable the socket listener and verify daemon activation with a ping."""
+    """Purpose: start the socket listener and verify daemon activation with a ping.
+
+    Args:
+        None: Starts the configured user socket unit.
+
+    Returns:
+        None: Emits the daemon ping or systemd failure envelope.
+
+    Examples:
+        >>> callable(admin_start)
+        True
+        >>> admin_start.__name__
+        'admin_start'
+    """
     result = _systemctl("start", "browser-proxy.socket")
     if result.meta.status == "ok":
         result = asyncio.run(request("ping", {}))
@@ -193,7 +234,7 @@ def admin_start() -> None:
 
 @admin_app.command("stop")
 def admin_stop() -> None:
-    """Request graceful daemon shutdown.
+    """Purpose: request graceful daemon shutdown.
 
     Args:
         None.
@@ -213,7 +254,20 @@ def admin_stop() -> None:
 
 @admin_app.command("doctor")
 def admin_doctor() -> None:
-    """Report Edge binary, bridge pairing, and daemon connectivity without secrets."""
+    """Purpose: report Edge, pairing, and daemon health without secret values.
+
+    Args:
+        None: Inspects local executable availability and daemon reachability.
+
+    Returns:
+        None: Emits a redacted health envelope.
+
+    Examples:
+        >>> callable(admin_doctor)
+        True
+        >>> admin_doctor.__name__
+        'admin_doctor'
+    """
     status = asyncio.run(request("ping", {}))
     _emit(
         Envelope.ok(
@@ -236,7 +290,20 @@ admin_app.add_typer(extension_app, name="extension")
 
 @extension_app.command("pair")
 def admin_extension_pair() -> None:
-    """Rotate the protected local extension capability without printing its secret."""
+    """Purpose: rotate the local extension capability without printing its secret.
+
+    Args:
+        None: Creates a replacement protected local pairing capability.
+
+    Returns:
+        None: Emits only confirmation, never the capability value.
+
+    Examples:
+        >>> callable(admin_extension_pair)
+        True
+        >>> admin_extension_pair.__name__
+        'admin_extension_pair'
+    """
     ExtensionBridge().pair()
     _emit(
         Envelope.ok({"paired": True, "bridge": "ws://127.0.0.1 (capability stored locally)"}), None
@@ -245,7 +312,7 @@ def admin_extension_pair() -> None:
 
 @app.command("daemon", hidden=True)
 def daemon() -> None:
-    """Run the managed daemon entrypoint used only by systemd.
+    """Purpose: run the managed daemon entrypoint used only by systemd.
 
     Args:
         None.

@@ -7,16 +7,19 @@
 The public interface is deliberately identical in philosophy to `tick-proxy`:
 
 ```text
-browser-proxy do <flat-domain-first-action> '<json>' [-o FILE] [-f json|table]
+browser-proxy do <flat-domain-first-action> '<one-json-object>' [-o FILE] [-f json|table]
 browser-proxy admin <command>
 ```
 
-The positional payload is always one JSON object or a path to a JSON object. Options never carry business data.
+The positional payload is always **exactly one JSON object** or a path to a file containing
+exactly one JSON object. Options only control presentation or output location; they never carry
+business data. This applies to every action, including `raw`.
 
 ```bash
 browser-proxy do profile-list '{}'
 browser-proxy do window-create '{"profile":"kpihx-labs","url":"https://example.com"}'
 browser-proxy do raw '{"method":"Target.getTargets","params":{}}'
+browser-proxy do group-list '{"profile":"kpihx-labs"}'
 ```
 
 Each successful command writes this envelope to stdout:
@@ -34,7 +37,15 @@ CLI → Unix socket → browser-proxyd → direct CDP → Edge profile processes
 
 `browser-proxyd` owns profile process lifecycle and target/window state. The extension provides approval overlays, secret-safe user input, Edge tab-group operations, and difficult-widget fallback. Edge Workspaces are modeled as semantic containers inside profiles because Edge provides no documented Workspace API to CDP or extensions.
 
-The implemented action registry covers `profile-list`, `profile-start`, window and tab discovery/creation/activation/closure, direct CDP page discovery/metadata, `workspace-list` (explicitly heuristic), extension-backed bookmarks, and a conservative read-only `raw` CDP allowlist. Mutations are never unlocked by payload flags: they require a typed approval reply from the paired extension.
+The registry covers the full Edge profile hierarchy: profiles, heuristic Workspaces, windows,
+tab groups, tabs, pages, and profile bookmarks. `workspace-list` and `group-list` clearly label
+heuristic/non-authoritative data where Edge lacks a public Workspace API. The implementation is
+strictly Edge-only; it does not launch, target, or publish for Chrome.
+
+`raw` sends a browser-level CDP method and its parameters inside that same object. Conservative
+read-only methods (`Browser.getVersion`, `Target.getTargets`, and related inspection calls) run
+without approval. Every other raw method, including mutations, is blocked behind fail-closed
+extension approval; a payload flag can never bypass it.
 
 ## Lifecycle
 
@@ -61,4 +72,4 @@ make stress
 - The CLI uses a per-user Unix socket.
 - The extension authenticates with a paired, short-lived capability.
 - Password values and secret-bearing storage are never returned to an agent.
-- `raw` defaults to a read-only CDP allowlist; mutations require an explicit approval policy.
+- `raw` has a conservative read-only CDP allowlist; all mutations require extension approval.

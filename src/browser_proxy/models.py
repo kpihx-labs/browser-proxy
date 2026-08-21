@@ -57,12 +57,12 @@ class Envelope(BaseModel):
 
     @classmethod
     def ok(cls, data: Any, *, comment: str = "", edited: bool = False) -> "Envelope":
-        """Build a successful envelope.
+        """Purpose: build a successful envelope.
 
         Args:
-            data: Action-specific response data.
-            comment: Optional approved-review comment.
-            edited: Whether an approval changed the request.
+            data (Any): Action-specific response data.
+            comment (str): Optional approved-review comment.
+            edited (bool): Whether an approval changed the request.
 
         Returns:
             An envelope whose metadata has status ``ok``.
@@ -78,11 +78,11 @@ class Envelope(BaseModel):
 
     @classmethod
     def error(cls, code: str, *, message: str = "") -> "Envelope":
-        """Build a structured failure envelope.
+        """Purpose: build a structured failure envelope.
 
         Args:
-            code: Stable application error code.
-            message: Human-readable diagnostic with no secret content.
+            code (str): Stable application error code.
+            message (str): Human-readable diagnostic with no secret content.
 
         Returns:
             An envelope with ``error`` status and error data.

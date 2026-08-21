@@ -29,14 +29,20 @@ Verification belongs in `data.verification`. Diagnostics, review URLs, and error
 Edge user-data directory → persistent profile → Edge Workspace → window → tab group → tab → frame
 ```
 
-Only Edge profiles, windows, tab groups, tabs, frames, and the Edge profile bookmark tree have public APIs. Edge Workspace bindings are therefore explicitly tagged `heuristic` and never treated as authoritative identifiers.
+The registry addresses profiles, Workspaces, windows, tab groups, tabs, pages, and the Edge
+profile bookmark tree. Only Edge profiles, windows, tab groups, tabs, frames, and the Edge
+profile bookmark tree have public APIs. Edge Workspace bindings are explicitly tagged
+`heuristic` and never treated as authoritative identifiers. Group metadata obtained through the
+extension is likewise identified as heuristic when it is not an authoritative CDP identifier.
 
 ## Policy
 
 - `@require_approval`: visible, editable, 600-second fail-closed human review.
 - `@require_preflight`: protected identity fields are re-read before an approved mutation.
 - `@require_verification`: action result is read back and checked after mutation.
-- `raw`: read-only methods run directly; unknown or mutating CDP methods require approval.
+- `raw`: all payload, including `method` and object-valued `params`, remains in its single action
+  JSON object. Read-only methods run directly; unknown or mutating CDP methods require
+  fail-closed extension approval.
 
 ## Error codes
 
