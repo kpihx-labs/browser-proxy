@@ -11,7 +11,7 @@ from typing import Any
 
 from browser_proxy.actions import REGISTRY, validate_registry
 from browser_proxy.bridge import ExtensionBridge
-from browser_proxy.cdp import is_read_only_method
+from browser_proxy.cdp import CdpBrowser, is_read_only_method
 from browser_proxy.models import Envelope, RpcRequest
 from browser_proxy.paths import lock_path, runtime_dir, socket_path
 
@@ -133,6 +133,12 @@ class Daemon:
         try:
             fd = os.open(lock_path(), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
+            try:
+                owner = int(lock_path().read_text().strip())
+                os.kill(owner, 0)
+            except (OSError, ValueError):
+                lock_path().unlink(missing_ok=True)
+                return self._acquire_lock()
             return False
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
@@ -223,6 +229,7 @@ class Daemon:
             )
         )
         profile_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        env = os.environ.copy()
         process = await asyncio.to_thread(
             subprocess.Popen,
             [
@@ -232,14 +239,30 @@ class Daemon:
                 f"--user-data-dir={profile_root / name}",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--no-startup-window",
+                "--no-sandbox",
                 "about:blank",
             ],
+            env=env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         self._processes[name] = process
-        self.profiles[name] = port
-        return port
+        for _ in range(100):
+            if process.poll() is not None:
+                self._processes.pop(name, None)
+                stderr = process.stderr.read().decode() if process.stderr else "no stderr"
+                raise RuntimeError(f"PROFILE_UNAVAILABLE: Microsoft Edge exited before CDP became ready. Stderr: {stderr}")
+            try:
+                await CdpBrowser(port).call("Browser.getVersion", {})
+            except RuntimeError:
+                await asyncio.sleep(0.1)
+                continue
+            self.profiles[name] = port
+            return port
+        process.terminate()
+        self._processes.pop(name, None)
+        raise RuntimeError("CDP_UNAVAILABLE: Microsoft Edge CDP readiness timed out")
 
     @staticmethod
     def _free_port() -> int:
