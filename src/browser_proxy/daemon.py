@@ -2,18 +2,29 @@
 
 import asyncio
 import os
-import shutil
 import socket
 import subprocess
-from pathlib import Path
 from time import monotonic
 from typing import Any
 
+import shutil
+
+from browser_proxy import config
 from browser_proxy.actions import REGISTRY, validate_registry
 from browser_proxy.bridge import ExtensionBridge
 from browser_proxy.cdp import CdpBrowser, is_read_only_method
 from browser_proxy.models import Envelope, RpcRequest
-from browser_proxy.paths import lock_path, runtime_dir, socket_path
+from browser_proxy.paths import (
+    discover_edge_profiles,
+    edge_cdp_port,
+    edge_profile_dir,
+    edge_profile_state,
+    lock_path,
+    materialize_edge_profile,
+    runtime_dir,
+    socket_path,
+)
+from browser_proxy.profile_state import describe_edge_profile, edge_unit_name, is_edge_unit_active
 
 
 class Daemon:
@@ -29,22 +40,22 @@ class Daemon:
             max_lifetime_seconds (int | None): Hard lifetime override; environment default when absent.
 
         Returns:
-            None: Creates an unstarted daemon with no managed profiles.
+            None: Creates an unstarted daemon; persistent profile identity remains on disk.
 
         Examples:
             >>> Daemon(idle_seconds=5).idle_seconds
             5
-            >>> Daemon(max_lifetime_seconds=10).profiles
-            {}
+            >>> Daemon(max_lifetime_seconds=10).bridge.connected
+            False
         """
         self.idle_seconds = idle_seconds or int(
-            os.environ.get("BROWSER_PROXY_IDLE_SECONDS", "1800")
+            os.environ.get(config.ENV_IDLE_SECONDS, str(config.IDLE_SECONDS_DEFAULT))
         )
         self.max_lifetime_seconds = max_lifetime_seconds or int(
-            os.environ.get("BROWSER_PROXY_MAX_LIFETIME_SECONDS", "28800")
+            os.environ.get(
+                config.ENV_MAX_LIFETIME_SECONDS, str(config.MAX_LIFETIME_SECONDS_DEFAULT)
+            )
         )
-        self.profiles: dict[str, int] = {}
-        self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._stop = asyncio.Event()
         self._last_work = monotonic()
         self.bridge = ExtensionBridge()
@@ -61,8 +72,8 @@ class Daemon:
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon.serve)
             True
-            >>> Daemon(idle_seconds=1).profiles
-            {}
+            >>> Daemon(idle_seconds=1).idle_seconds
+            1
         """
         validate_registry()
         runtime_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -88,9 +99,6 @@ class Daemon:
                 server.close()
                 await server.wait_closed()
             await self.bridge.stop()
-            for process in self._processes.values():
-                if process.poll() is None:
-                    process.terminate()
             if activated is None:
                 local_socket.unlink(missing_ok=True)
             lock_path().unlink(missing_ok=True)
@@ -148,10 +156,16 @@ class Daemon:
         """Purpose: stop after the configured idle or maximum-lifetime limit.
 
         Args:
-            self (Daemon): Daemon whose activity timestamps and stop event are monitored.
+            self (Daemon): Daemon whose activity timestamps, bridge connection, and stop event
+                are monitored.
 
         Returns:
-            None: Raises the internal ``DAEMON_STOP`` signal after setting stop state.
+            None: Raises the internal ``DAEMON_STOP`` signal after setting stop state. The idle
+            timer is suspended entirely while an authenticated extension is connected — a paired,
+            idle-but-connected extension must never be force-disconnected just because no CLI
+            command happened to run in the last ``idle_seconds`` (previously the daemon stopped
+            regardless, silently dropping a healthy bridge connection). ``max_lifetime_seconds``
+            still applies unconditionally as the hard, unavoidable ceiling.
 
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon._lifecycle)
@@ -162,10 +176,11 @@ class Daemon:
         started = monotonic()
         while not self._stop.is_set():
             await asyncio.sleep(0.2)
-            if (
-                monotonic() - started >= self.max_lifetime_seconds
-                or monotonic() - self._last_work >= self.idle_seconds
-            ):
+            lifetime_expired = monotonic() - started >= self.max_lifetime_seconds
+            idle_expired = (
+                not self.bridge.connected and monotonic() - self._last_work >= self.idle_seconds
+            )
+            if lifetime_expired or idle_expired:
                 self._stop.set()
         raise RuntimeError("DAEMON_STOP")
 
@@ -199,100 +214,150 @@ class Daemon:
         await writer.wait_closed()
 
     async def start_profile(self, name: str) -> int:
-        """Purpose: start Edge with an isolated persistent profile and loopback CDP.
+        """Purpose: ensure one systemd-managed Edge profile is running and CDP-ready.
 
         Args:
-            self (Daemon): Daemon instance that owns the spawned Edge process.
+            self (Daemon): Daemon instance resolving the profile's CDP endpoint.
             name (str): Safe persistent profile directory name.
 
         Returns:
-            int: Loopback CDP port assigned to the started or existing profile.
+            int: Loopback CDP port assigned to the started or already-running profile.
+            Always a real, visible Edge window — 100% Transparency, no headless
+            mode exists.
 
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon.start_profile)
             True
-            >>> 'default' not in Daemon().profiles
+            >>> isinstance(Daemon().bridge.connected, bool)
             True
         """
-        if name in self.profiles:
-            return self.profiles[name]
-        if not name or any(part in name for part in ("/", "\\", "..")):
-            raise ValueError("invalid profile name")
-        executable = os.environ.get("BROWSER_PROXY_EDGE_PATH") or shutil.which("microsoft-edge")
-        if executable is None:
-            raise RuntimeError("PROFILE_UNAVAILABLE: Microsoft Edge executable not found")
-        port = self._free_port()
-        profile_root = Path(
-            os.environ.get(
-                "BROWSER_PROXY_PROFILE_ROOT",
-                str(Path.home() / ".local/share/browser-proxy/profiles"),
+        materialize_edge_profile(name)
+        port = edge_cdp_port(name)
+        unit = edge_unit_name(name)
+        if not await is_edge_unit_active(unit):
+            started = await asyncio.to_thread(
+                subprocess.run,
+                ["systemctl", "--user", "start", unit],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-        )
-        profile_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        env = os.environ.copy()
-        process = await asyncio.to_thread(
-            subprocess.Popen,
-            [
-                executable,
-                f"--remote-debugging-port={port}",
-                "--remote-debugging-address=127.0.0.1",
-                f"--user-data-dir={profile_root / name}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--no-startup-window",
-                "--no-sandbox",
-                "about:blank",
-            ],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        self._processes[name] = process
-        for _ in range(100):
-            if process.poll() is not None:
-                self._processes.pop(name, None)
-                stderr = process.stderr.read().decode() if process.stderr else "no stderr"
+            if started.returncode:
                 raise RuntimeError(
-                    f"PROFILE_UNAVAILABLE: Microsoft Edge exited before CDP became ready. Stderr: {stderr}"
+                    f"PROFILE_UNAVAILABLE: systemctl could not start {unit}: "
+                    f"{started.stderr.strip() or 'unknown systemctl failure'}"
                 )
+        for _ in range(100):
             try:
                 await CdpBrowser(port).call("Browser.getVersion", {})
             except RuntimeError:
                 await asyncio.sleep(0.1)
                 continue
-            self.profiles[name] = port
             return port
-        process.terminate()
-        self._processes.pop(name, None)
         raise RuntimeError("CDP_UNAVAILABLE: Microsoft Edge CDP readiness timed out")
 
-    @staticmethod
-    def _free_port() -> int:
-        """Purpose: allocate a currently free loopback TCP port for Edge startup.
+    async def profile_inventory(self) -> list[dict[str, Any]]:
+        """Purpose: report every persistent on-disk profile with its live service AND bridge state.
 
         Args:
-            None: Binds an ephemeral local TCP listener temporarily.
+            None: Discovers profile directories; does not create or start any profile.
 
         Returns:
-            int: Candidate loopback port number released before process startup.
+            list[dict[str, Any]]: ``profile_state.describe_edge_profile()``'s 3 daemon-independent
+            axes (disk identity, systemd activation, CDP reachability) plus the one axis only a
+            running daemon can know: ``extension_connected`` (this exact profile name is a key in
+            ``self.bridge.connected_profiles()`` — never a global aggregate hiding which profile).
 
         Examples:
-            >>> 0 < Daemon._free_port() < 65536
+            >>> asyncio.iscoroutinefunction(Daemon.profile_inventory)
             True
-            >>> isinstance(Daemon._free_port(), int)
+            >>> isinstance(Daemon().bridge.connected, bool)
             True
         """
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.bind(("127.0.0.1", 0))
-            return int(listener.getsockname()[1])
+        connected = self.bridge.connected_profiles()
+        profiles: list[dict[str, Any]] = []
+        for profile_dir in discover_edge_profiles():
+            description = await describe_edge_profile(profile_dir.name)
+            description["extension_connected"] = profile_dir.name in connected
+            profiles.append(description)
+        return profiles
 
-    async def extension_request(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Purpose: dispatch a typed request to the authenticated extension bridge.
+    async def remove_profile(self, name: str) -> dict[str, Any]:
+        """Purpose: stop and safely trash one persistent Edge profile — never a permanent delete.
+
+        Args:
+            self (Daemon): Daemon instance stopping the profile's systemd unit if active.
+            name (str): Persistent Edge profile name to remove.
+
+        Returns:
+            dict[str, Any]: ``profile``, ``removed`` (always ``True`` on success), ``was_active``
+            (whether the unit had to be stopped first), and ``trashed_path`` (the exact former
+            profile directory, now living in the KpihX trash — recoverable with ``trash-restore``,
+            never a ``shutil.rmtree``). Calls ``trash-put`` (the same `trash-cli` binary the
+            interactive ``rm`` wrapper delegates to) by its resolved absolute path rather than
+            relying on this process's ``$PATH`` containing the wrapper — a systemd-spawned daemon
+            subprocess is not guaranteed the same shell ``$PATH`` ordering an interactive session has.
+
+        Raises:
+            RuntimeError: ``PROFILE_UNAVAILABLE: ...`` when the profile was never declared, or when
+                ``trash-put`` is missing or fails.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(Daemon.remove_profile)
+            True
+            >>> isinstance(Daemon().bridge.connected, bool)
+            True
+        """
+        profile_dir = edge_profile_dir(name)
+        if edge_profile_state(profile_dir) == "not_declared":
+            raise RuntimeError(f"PROFILE_UNAVAILABLE: {name} is not declared — nothing to remove")
+        unit = edge_unit_name(name)
+        was_active = await is_edge_unit_active(unit)
+        if was_active:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["systemctl", "--user", "stop", unit],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        trash_put = shutil.which(config.TRASH_PUT_BINARY)
+        if trash_put is None:
+            raise RuntimeError(
+                f"PROFILE_UNAVAILABLE: {name} could not be removed: "
+                f"'{config.TRASH_PUT_BINARY}' binary not found — refusing to fall back to a "
+                "permanent delete"
+            )
+        trashed = await asyncio.to_thread(
+            subprocess.run,
+            [trash_put, str(profile_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if trashed.returncode:
+            raise RuntimeError(
+                f"PROFILE_UNAVAILABLE: {name} could not be trashed: "
+                f"{trashed.stderr.strip() or 'unknown trash-put failure'}"
+            )
+        return {
+            "profile": name,
+            "removed": True,
+            "was_active": was_active,
+            "trashed_path": str(profile_dir),
+        }
+
+    async def extension_request(
+        self, kind: str, payload: dict[str, Any], profile: str
+    ) -> dict[str, Any]:
+        """Purpose: dispatch a typed request to THAT profile's authenticated extension bridge.
 
         Args:
             self (Daemon): Daemon instance owning the extension bridge.
             kind (str): Typed bridge operation such as ``bookmark.list``.
             payload (dict[str, Any]): Complete single action object sent to the bridge.
+            profile (str): Target browser-proxy profile; never silently answered by a different
+                profile's connected extension.
 
         Returns:
             dict[str, Any]: Object-valued successful extension response data.
@@ -303,23 +368,25 @@ class Daemon:
             >>> Daemon().bridge.connected
             False
         """
-        reply = await self.bridge.request(kind, payload)
+        reply = await self.bridge.request(kind, payload, profile)
         if not reply.get("ok"):
-            raise RuntimeError("EXTENSION_UNAVAILABLE")
+            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}")
         data = reply.get("data", {})
         if not isinstance(data, dict):
-            raise RuntimeError("EXTENSION_UNAVAILABLE")
+            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}")
         return data
 
     async def _approve(
         self, action: str, payload: dict[str, Any]
     ) -> tuple[dict[str, Any], str, bool]:
-        """Purpose: request fail-closed, editable approval from the paired extension.
+        """Purpose: request fail-closed, editable approval from the SAME profile's paired extension.
 
         Args:
             self (Daemon): Daemon instance owning the extension bridge.
             action (str): Public action requiring approval.
-            payload (dict[str, Any]): Complete single action object proposed for approval.
+            payload (dict[str, Any]): Complete single action object proposed for approval; its
+                ``profile`` field selects which Edge window shows the overlay — never routed to
+                an unrelated profile's window, which would let the wrong human approve the action.
 
         Returns:
             tuple[dict[str, Any], str, bool]: Approved object, reviewer comment, edit flag.
@@ -330,8 +397,11 @@ class Daemon:
             >>> Daemon().bridge.connected
             False
         """
+        profile = str(payload.get("profile", "default"))
         reply = await self.bridge.request(
-            "approval", {"action": action, "payload": payload, "timeout_seconds": 600}
+            "approval",
+            {"action": action, "payload": payload, "timeout_seconds": 600},
+            profile,
         )
         if not reply.get("ok"):
             raise PermissionError("APPROVAL_REJECTED")
@@ -356,15 +426,16 @@ class Daemon:
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon.dispatch)
             True
-            >>> Daemon().profiles == {}
+            >>> isinstance(Daemon().bridge.connected, bool)
             True
         """
         if request.method == "ping":
             return Envelope.ok(
                 {
                     "ready": True,
-                    "profiles": self.profiles,
+                    "profiles": await self.profile_inventory(),
                     "extension_connected": self.bridge.connected,
+                    "extension_connected_profiles": list(self.bridge.connected_profiles()),
                 }
             )
         self._last_work = monotonic()
@@ -374,9 +445,10 @@ class Daemon:
         if request.method == "admin.status":
             return Envelope.ok(
                 {
-                    "profiles": self.profiles,
+                    "profiles": await self.profile_inventory(),
                     "socket": str(socket_path()),
                     "extension_connected": self.bridge.connected,
+                    "extension_connected_profiles": list(self.bridge.connected_profiles()),
                 }
             )
         if request.method != "do":

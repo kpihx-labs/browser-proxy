@@ -49,3 +49,32 @@ def test_idle_and_lifetime_signals_stop_without_client_activity() -> None:
             await lifetime._lifecycle()
 
     asyncio.run(run())
+
+
+def test_idle_timeout_is_suspended_while_an_extension_stays_connected() -> None:
+    """A paired, idle-but-connected extension must never be force-disconnected by the idle TTL
+    (regression guard for the exact bug that caused frequent, unexplained bridge drops)."""
+
+    async def run() -> None:
+        daemon = Daemon(idle_seconds=0.05, max_lifetime_seconds=30)
+        daemon.bridge._connections["default"] = object()  # type: ignore[assignment]
+        task = asyncio.create_task(daemon._lifecycle())
+        await asyncio.sleep(0.3)
+        assert not task.done()
+        daemon.bridge._connections.clear()
+        with pytest.raises(RuntimeError, match="DAEMON_STOP"):
+            await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(run())
+
+
+def test_max_lifetime_still_applies_while_an_extension_stays_connected() -> None:
+    """The hard lifetime cap is never suspended, even with a connected extension."""
+
+    async def run() -> None:
+        daemon = Daemon(idle_seconds=30, max_lifetime_seconds=0.05)
+        daemon.bridge._connections["default"] = object()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="DAEMON_STOP"):
+            await daemon._lifecycle()
+
+    asyncio.run(run())

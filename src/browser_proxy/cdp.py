@@ -192,6 +192,86 @@ class CdpBrowser:
         finally:
             await self.call("Target.detachFromTarget", {"sessionId": session_id})
 
+    async def page_session(
+        self, target_id: str, calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Purpose: run several page-scoped CDP calls within one attached flattened session.
+
+        Args:
+            self (CdpBrowser): Client bound to one managed Edge debugging port.
+            target_id (str): CDP page target receiving every call in this session.
+            calls (list[tuple[str, dict[str, Any]]]): Ordered ``(method, params)`` pairs.
+
+        Returns:
+            list[dict[str, Any]]: Result objects in the same order as ``calls``.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(CdpBrowser.page_session)
+            True
+            >>> CdpBrowser(9222)._next_id
+            0
+        """
+        async with connect(await self._browser_ws_url()) as websocket:
+            self._next_id += 1
+            attach_id = self._next_id
+            await websocket.send(
+                json.dumps(
+                    {
+                        "id": attach_id,
+                        "method": "Target.attachToTarget",
+                        "params": {"targetId": target_id, "flatten": True},
+                    }
+                )
+            )
+            session_id: str | None = None
+            async for raw in _messages(websocket):
+                response = json.loads(raw)
+                if response.get("id") == attach_id:
+                    result = response.get("result", {})
+                    session_id = result.get("sessionId") if isinstance(result, dict) else None
+                    break
+            if not session_id:
+                raise RuntimeError("CDP_ERROR: attach did not return sessionId")
+            results: list[dict[str, Any]] = []
+            try:
+                for method, params in calls:
+                    self._next_id += 1
+                    call_id = self._next_id
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "id": call_id,
+                                "sessionId": session_id,
+                                "method": method,
+                                "params": params,
+                            }
+                        )
+                    )
+                    async for raw in _messages(websocket):
+                        response = json.loads(raw)
+                        if (
+                            response.get("id") == call_id
+                            and response.get("sessionId") == session_id
+                        ):
+                            if error := response.get("error"):
+                                raise RuntimeError(f"CDP_ERROR: {error.get('message', error)}")
+                            result = response.get("result", {})
+                            results.append(result if isinstance(result, dict) else {})
+                            break
+            finally:
+                self._next_id += 1
+                detach_id = self._next_id
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": detach_id,
+                            "method": "Target.detachFromTarget",
+                            "params": {"sessionId": session_id},
+                        }
+                    )
+                )
+            return results
+
 
 async def _messages(websocket: Any) -> AsyncIterator[str]:
     """Purpose: yield text frames from a WebSocket at a narrow type boundary.

@@ -22,15 +22,38 @@ def test_registry_covers_all_required_edge_domains() -> None:
         "raw",
     } <= set(REGISTRY)
     assert not REGISTRY["raw"].policy.approval
-    assert REGISTRY["window-create"].policy.approval
+    # Deliberately NOT approval-gated (KπX directive): every managed Edge window is already
+    # always real and visible — opening one is directly observable, no hidden side effect to gate.
+    assert REGISTRY["window-create"].policy.approval is False
+    assert REGISTRY["window-create"].policy.preflight_fields == ("profile",)
+    assert REGISTRY["window-create"].policy.verification == ("url",)
+    # Same rationale, same KπX directive: opening a tab in an always-visible window is
+    # directly observable too.
+    assert REGISTRY["tab-create"].policy.approval is False
+    assert REGISTRY["tab-create"].policy.preflight_fields == ("profile",)
+    assert REGISTRY["tab-create"].policy.verification == ("url",)
 
 
-def test_readiness_does_not_require_edge() -> None:
+def test_registry_covers_the_restored_page_control_action_surface() -> None:
+    """The registry restores full page-driving, cookie, and human-in-the-loop parity."""
+    assert {
+        "page-navigate",
+        "page-click",
+        "page-evaluate",
+        "cookie-list",
+        "browser-ask-user",
+    } <= set(REGISTRY)
+    assert REGISTRY["cookie-set"].policy.approval is True
+    assert REGISTRY["page-evaluate"].policy.approval is False
+
+
+def test_readiness_does_not_require_edge(tmp_path: Path, monkeypatch) -> None:
     """Ping is available before Edge, profiles, or the extension are connected."""
+    monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
     result = asyncio.run(Daemon().dispatch(RpcRequest(id="1", method="ping")))
     assert result.meta.status == "ok"
     assert result.data["ready"] is True
-    assert result.data["profiles"] == {}
+    assert result.data["profiles"] == []
 
 
 def test_raw_mutation_requires_the_extension_before_cdp() -> None:
@@ -54,6 +77,7 @@ def test_socket_roundtrip_uses_real_client_transport(tmp_path: Path, monkeypatch
     """An isolated daemon accepts a real client request over its Unix-domain socket."""
     monkeypatch.setenv("BROWSER_PROXY_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("BROWSER_PROXY_EXTENSION_PORT", "39391")
+    monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
 
     async def run() -> None:
         daemon = Daemon(idle_seconds=30, max_lifetime_seconds=30)

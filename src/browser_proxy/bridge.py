@@ -8,26 +8,36 @@ from typing import Any
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 
-from browser_proxy.paths import extension_port, pairing_token_path, runtime_dir
+from browser_proxy.paths import extension_port, pairing_token_path, persistent_state_dir
 
 
 @dataclass
 class ExtensionBridge:
-    """Own extension authentication and typed request/response dispatch."""
+    """Own extension authentication and typed request/response dispatch.
+
+    One systemd-templated Edge instance == one browser-proxy profile == one isolated extension
+    install (separate ``chrome.storage.local``, separate options page). Each install declares its
+    own profile identity in its handshake; connections are keyed by that name so a request for
+    profile "research" is never silently answered by profile "default"'s extension — the single
+    root cause of the "3 profiles returned the exact same bookmark tree" confusion.
+    """
 
     timeout_seconds: float = 600.0
     _server: Server | None = None
-    _connection: ServerConnection | None = None
+    _connections: dict[str, ServerConnection] = field(default_factory=dict)
     _pending: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
 
-    def pair(self) -> None:
-        """Purpose: create a protected pairing capability without exposing it in output.
+    def pair(self, token: str) -> None:
+        """Purpose: persist an operator-provisioned pairing capability without exposing it in output.
 
         Args:
             self (ExtensionBridge): Bridge whose private runtime capability is rotated.
+            token (str): Non-empty capability generated visibly in the extension options page and
+                entered through the CLI's hidden terminal prompt.
 
         Returns:
-            None: Persists a newly generated mode-0600 local capability.
+            None: Persists the supplied mode-0600 local capability under ``persistent_state_dir()``
+            — a directory that survives reboot/logout, unlike the daemon's ephemeral runtime dir.
 
         Examples:
             >>> callable(ExtensionBridge.pair)
@@ -36,19 +46,22 @@ class ExtensionBridge:
             1
         """
 
-        runtime_dir().mkdir(parents=True, exist_ok=True)
+        if len(token) < 16 or not token.isascii():
+            raise ValueError("pairing secret must be ASCII and contain at least 16 characters")
+        persistent_state_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
         path = pairing_token_path()
-        path.write_text(secrets.token_urlsafe(32), encoding="utf-8")
+        path.write_text(token, encoding="utf-8")
         path.chmod(0o600)
 
     def _token(self) -> str:
-        """Purpose: load or initialize the private extension pairing capability.
+        """Purpose: load the private extension pairing capability without implicit creation.
 
         Args:
             self (ExtensionBridge): Bridge whose private token path is consulted.
 
         Returns:
-            str: Non-empty local capability used only for constant-time comparison.
+            str: Existing local capability used only for constant-time comparison, or ``""`` when
+            explicit operator pairing has not happened yet.
 
         Examples:
             >>> callable(ExtensionBridge._token)
@@ -57,9 +70,7 @@ class ExtensionBridge:
             True
         """
         path = pairing_token_path()
-        if not path.exists():
-            self.pair()
-        return path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
     async def start(self) -> None:
         """Purpose: start the private loopback bridge once per daemon.
@@ -104,17 +115,19 @@ class ExtensionBridge:
             if not future.done():
                 future.set_exception(RuntimeError("EXTENSION_UNAVAILABLE"))
         self._pending.clear()
-        self._connection = None
+        self._connections.clear()
 
     @property
     def connected(self) -> bool:
-        """Purpose: report whether an authenticated extension is currently connected.
+        """Purpose: report whether ANY authenticated extension is currently connected.
 
         Args:
-            self (ExtensionBridge): Bridge whose active WebSocket is inspected.
+            self (ExtensionBridge): Bridge whose active connections are inspected.
 
         Returns:
-            bool: ``True`` only while an authenticated extension connection exists.
+            bool: ``True`` while at least one profile's extension is connected. This is a coarse
+            "is anything at all attached" glance only — use ``is_connected(profile)`` or
+            ``connected_profiles()`` for the precise per-profile truth a real request depends on.
 
         Examples:
             >>> ExtensionBridge().connected
@@ -123,7 +136,45 @@ class ExtensionBridge:
             True
         """
 
-        return self._connection is not None
+        return bool(self._connections)
+
+    def is_connected(self, profile: str) -> bool:
+        """Purpose: report whether ONE specific profile's extension is currently connected.
+
+        Args:
+            profile (str): Browser-proxy profile name declared by the extension at handshake.
+
+        Returns:
+            bool: ``True`` only when that exact profile has an authenticated connection.
+
+        Examples:
+            >>> ExtensionBridge().is_connected('default')
+            False
+            >>> isinstance(ExtensionBridge().is_connected('default'), bool)
+            True
+        """
+
+        return profile in self._connections
+
+    def connected_profiles(self) -> tuple[str, ...]:
+        """Purpose: list every profile with a currently authenticated extension connection.
+
+        Args:
+            self (ExtensionBridge): Bridge whose active connections are inspected.
+
+        Returns:
+            tuple[str, ...]: Sorted profile names, never a bare aggregate boolean — the same
+            "one predicate everywhere" discipline as ``paths.edge_profile_state()``, so
+            ``admin status``/``admin doctor`` can never hide which specific profile is attached.
+
+        Examples:
+            >>> ExtensionBridge().connected_profiles()
+            ()
+            >>> isinstance(ExtensionBridge().connected_profiles(), tuple)
+            True
+        """
+
+        return tuple(sorted(self._connections))
 
     @property
     def port(self) -> int:
@@ -147,16 +198,22 @@ class ExtensionBridge:
         address = next(iter(self._server.sockets)).getsockname()
         return int(address[1])
 
-    async def request(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Purpose: dispatch a typed request to the paired extension and await its reply.
+    async def request(self, kind: str, payload: dict[str, Any], profile: str) -> dict[str, Any]:
+        """Purpose: dispatch a typed request to ONE specific profile's paired extension.
 
         Args:
             self (ExtensionBridge): Authenticated bridge that sends the request.
             kind (str): Typed extension operation such as ``bookmark.list``.
             payload (dict[str, Any]): Complete single action object to forward unchanged.
+            profile (str): Target browser-proxy profile — the request is routed exclusively to
+                that profile's own connection, never to whichever extension happens to be attached.
 
         Returns:
             dict[str, Any]: Typed extension reply with ``ok`` and object-valued ``data``.
+
+        Raises:
+            RuntimeError: ``EXTENSION_UNAVAILABLE: <profile>`` when that exact profile has no
+                authenticated connection — even if a different profile's extension is connected.
 
         Examples:
             >>> asyncio.iscoroutinefunction(ExtensionBridge.request)
@@ -165,12 +222,13 @@ class ExtensionBridge:
             2
         """
 
-        if self._connection is None:
-            raise RuntimeError("EXTENSION_UNAVAILABLE")
+        connection = self._connections.get(profile)
+        if connection is None:
+            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}")
         request_id = secrets.token_urlsafe(12)
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._connection.send(
+        await connection.send(
             json.dumps({"type": "request", "id": request_id, "kind": kind, "payload": payload})
         )
         try:
@@ -179,14 +237,16 @@ class ExtensionBridge:
             self._pending.pop(request_id, None)
 
     async def _handle(self, connection: ServerConnection) -> None:
-        """Purpose: authenticate one extension and route its typed responses.
+        """Purpose: authenticate one extension for its declared profile and route its replies.
 
         Args:
-            self (ExtensionBridge): Bridge storing the authenticated connection.
+            self (ExtensionBridge): Bridge storing the authenticated per-profile connection.
             connection (ServerConnection): Newly accepted loopback WebSocket connection.
 
         Returns:
-            None: Closes malformed connections and resolves matching pending requests.
+            None: Closes malformed connections and resolves matching pending requests. A second
+            connection declaring the same ``profile`` replaces the first (last-connect-wins), the
+            same recovery semantics as a single-profile bridge had before profiles were multiplexed.
 
         Examples:
             >>> asyncio.iscoroutinefunction(ExtensionBridge._handle)
@@ -195,6 +255,7 @@ class ExtensionBridge:
             True
         """
 
+        profile = ""
         try:
             raw = await asyncio.wait_for(connection.recv(), timeout=10)
             message = json.loads(raw)
@@ -202,13 +263,23 @@ class ExtensionBridge:
                 await connection.close(code=4000, reason="handshake required")
                 return
             token = message.get("token")
-            if not isinstance(token, str) or not secrets.compare_digest(token, self._token()):
+            expected = self._token()
+            if (
+                not isinstance(token, str)
+                or not expected
+                or not secrets.compare_digest(token.encode(), expected.encode())
+            ):
                 await connection.close(code=4001, reason="authentication failed")
                 return
             if not isinstance(message.get("extension_id"), str):
                 await connection.close(code=4002, reason="extension_id required")
                 return
-            self._connection = connection
+            declared_profile = message.get("profile")
+            if not isinstance(declared_profile, str) or not declared_profile:
+                await connection.close(code=4004, reason="profile required")
+                return
+            profile = declared_profile
+            self._connections[profile] = connection
             await connection.send(
                 json.dumps({"type": "handshake", "status": "accepted", "protocol": 1})
             )
@@ -226,5 +297,5 @@ class ExtensionBridge:
         except (TimeoutError, json.JSONDecodeError):
             await connection.close(code=4003, reason="invalid bridge message")
         finally:
-            if self._connection is connection:
-                self._connection = None
+            if profile and self._connections.get(profile) is connection:
+                del self._connections[profile]

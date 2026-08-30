@@ -66,7 +66,7 @@ def test_direct_cdp_call_uses_http_discovery_and_websocket_request(monkeypatch) 
     assert websocket.sent == [{"id": 1, "method": "Browser.getVersion", "params": {}}]
 
 
-def test_raw_read_only_bypasses_approval_but_mutation_is_approved(monkeypatch) -> None:
+def test_raw_read_only_bypasses_approval_but_mutation_is_approved(monkeypatch, tmp_path) -> None:
     """Read-only raw CDP is direct; a mutation cannot reach CDP before approval."""
     approvals: list[dict[str, Any]] = []
     calls: list[str] = []
@@ -81,8 +81,11 @@ def test_raw_read_only_bypasses_approval_but_mutation_is_approved(monkeypatch) -
         approvals.append({"action": action, "payload": payload})
         return payload, "approved in test", False
 
+    monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
+    (tmp_path / "profiles/default").mkdir(parents=True)
+    (tmp_path / "profiles/default/Local State").write_text("{}")
+    monkeypatch.setenv("BROWSER_PROXY_EDGE_PORT", "9222")
     daemon = Daemon()
-    daemon.profiles["default"] = 9222
     monkeypatch.setattr(CdpBrowser, "call", call)
     monkeypatch.setattr(Daemon, "_approve", approve)
 
@@ -133,3 +136,72 @@ def test_registry_covers_full_profile_hierarchy_and_object_payload_contract() ->
     groups = {action.group for action in REGISTRY.values()}
     assert {"Profiles", "Workspaces", "Windows", "Groups", "Tabs", "Bookmarks"} <= groups
     assert REGISTRY["raw"].policy.approval is False
+
+
+class _SessionWebSocket:
+    """Simulate one flattened attach/call/call/detach exchange for ``page_session``."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    def __aiter__(self) -> "_SessionWebSocket":
+        self._frames = iter(
+            [
+                json.dumps({"id": 1, "result": {"sessionId": "session-1"}}),
+                json.dumps(
+                    {"id": 2, "sessionId": "session-1", "result": {"nodes": [], "step": "enable"}}
+                ),
+                json.dumps(
+                    {"id": 3, "sessionId": "session-1", "result": {"nodes": [1], "step": "tree"}}
+                ),
+                json.dumps({"id": 4, "sessionId": "session-1", "result": {}}),
+            ]
+        )
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return next(self._frames)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+
+def test_page_session_uses_flattened_top_level_session_id(monkeypatch) -> None:
+    """``page_session`` attaches once and issues N flattened calls sharing one sessionId."""
+    websocket = _SessionWebSocket()
+    monkeypatch.setattr("browser_proxy.cdp.urlopen", lambda *_args, **_kwargs: _HttpResponse())
+    monkeypatch.setattr("browser_proxy.cdp.connect", lambda _url: websocket)
+
+    results = asyncio.run(
+        CdpBrowser(9222).page_session(
+            "target-1",
+            [("Accessibility.enable", {}), ("Accessibility.getFullAXTree", {})],
+        )
+    )
+
+    assert results == [{"nodes": [], "step": "enable"}, {"nodes": [1], "step": "tree"}]
+    assert websocket.sent[0] == {
+        "id": 1,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "target-1", "flatten": True},
+    }
+    for frame in websocket.sent[1:3]:
+        assert "sessionId" in frame
+        assert frame["sessionId"] == "session-1"
+    assert websocket.sent[1]["method"] == "Accessibility.enable"
+    assert websocket.sent[2]["method"] == "Accessibility.getFullAXTree"
+    assert websocket.sent[3] == {
+        "id": 4,
+        "method": "Target.detachFromTarget",
+        "params": {"sessionId": "session-1"},
+    }
+    assert all("message" not in frame for frame in websocket.sent)

@@ -2,13 +2,24 @@
 
 ## Purpose
 
-`browser-proxy` is the single JSON-RPC CLI for KπX **Microsoft Edge-only** operations. It owns a socket-activated daemon, direct Edge CDP connections, profile-aware windows, bookmarks, approvals, and an extension bridge. Agents never call browser MCPs directly.
+`browser-proxy` is the single JSON-RPC CLI for KπX **Microsoft Edge-only** operations. It owns an on-demand daemon, direct Edge CDP connections, profile-aware windows, bookmarks, approvals, and an extension bridge. Every Microsoft Edge instance is itself a separate systemd-templated user service — never a raw ad-hoc subprocess and never launched with a bare `microsoft-edge` command by hand. Agents never call browser MCPs directly.
 
 ## Invariants
 
-- Public CLI: `browser-proxy do <action> '<json>'` and `browser-proxy admin <action>`.
+- Public CLI: `browser-proxy do <action> '<json>'` and `browser-proxy admin <action>` (including `admin edge start/stop/status/install`). Everything, including one-time setup, goes through this one binary — never a raw `microsoft-edge`/`systemctl` command typed by hand.
 - `do` accepts one inline JSON object or one JSON file path; only output/help options are permitted.
 - Normal browser control uses CDP; the extension is only a privileged fallback and HITL surface.
+- Each named Edge profile is a single systemd-templated instance (`browser-proxy-edge@<profile>.service`). **There is no headless mode and no flag to hide the window — every managed Edge instance is always a real, visible window, by design (100% Transparency: KπX must always see what an agent is doing in the browser).** Its CDP port is deterministic (`edge_cdp_port()`, sha256-derived), so the daemon and the CLI always agree on it without inter-process handoff.
+- A profile is a persistent non-symlink directory beneath `$HOME/.local/share/browser-proxy/profiles/`; disk is its sole source of truth. `profile-list` discovers those directories and reports live systemd/CDP state. The daemon's lifetime must never erase or define profile identity. A Workspace is a separate heuristic container *inside* a profile — never use a workspace name as a profile example.
+- A "browser-proxy profile" (one `--user-data-dir`, one systemd unit, one CDP port) is a different level of the hierarchy than Edge's own internal people-profile concept (`Default`, `Profile 1`, … at `chrome://settings/people`, living *inside* one `--user-data-dir`) — never conflate the two. `materialize_edge_profile()` only `mkdir`s a directory (**declares** it); only Edge itself, by actually booting there once, makes it real (`Local State` marker present). `paths.edge_profile_state()` is the one predicate (`not_declared`/`declared`/`initialized`) used identically everywhere a profile is resolved or listed — never a private ad hoc directory-existence check. `materialize_edge_profile()` also refuses a name that collides case-insensitively with a different already-declared profile.
+- `src/browser_proxy/profile_state.py` is the single canonical module computing systemd activation and CDP reachability for one profile (`describe_edge_profile()`) — imported identically by `Daemon.profile_inventory()`/`start_profile()` AND `cli.admin_edge_status()`. Never re-implement this probe a second time anywhere.
+- `do profile-remove` stops the unit if active then moves the profile directory to the KpihX trash via `trash-put` resolved by absolute path (`shutil.which`) — never the `rm` shell wrapper (a daemon subprocess is not guaranteed the same `$PATH`), and never a permanent `shutil.rmtree`. Deliberately not `@require_approval` (admin-tier, like `admin edge start`/`stop`) since the most likely removal candidates have no reachable extension to approve.
+- Every default value and its overriding environment variable NAME lives in `src/browser_proxy/config.py` — never an inline literal in `paths.py`/`daemon.py`/`bridge.py`/`cli.py`.
+- The extension pairing secret lives in `paths.persistent_state_dir()` (survives reboot/logout) — never the daemon's ephemeral `runtime_dir()` (tmpfs). The daemon's idle TTL is suspended while an authenticated extension stays connected; only `max_lifetime_seconds` is an unconditional cap.
+- `ExtensionBridge` keys connections by the profile each install declares at handshake (`_connections: dict[str, ServerConnection]`) — never a single global connection slot. Every extension-mediated action (`_extension()`, `Daemon._approve()`) routes exclusively to that one profile's connection; a request for a profile with no matching connection fails closed by name (`EXTENSION_UNAVAILABLE: <profile>`), never silently answered by a different profile's extension. Each profile's Options page declares its own profile name (`browserProxyProfile` in `chrome.storage.local`) — this cannot be auto-discovered because Chrome extensions have no API exposing which `--user-data-dir` they run inside.
+- `window-create`/`tab-create` are deliberately NOT `@require_approval`-gated (KπX directive): every managed Edge window/tab is already always real and visible, so creating one is directly observable the instant it happens. `window-create`'s optional `items` field builds a whole ordered tab/group layout in one call (`_apply_window_items()`); grouping resolves real `chrome.tabs.Tab.id`s via the same extension mechanism `browser-get-new-tab` exposes standalone (`tab.capture_next`, armed concurrently with the CDP tab creation) — `chrome.tabs.group` cannot accept a CDP `target_id`. Items created this way bypass `tab-create`'s/`group-create`'s own individual approval gates too, since the whole layout is one deliberate command. **Not atomic**: a failure partway through `items` leaves whatever was already created in place (documented, not silently papered over).
+- Loading the unpacked extension and pairing it are the only two steps that remain genuinely manual (Chromium requires a real GUI file-picker and forbids automating either step) — done once per profile in the window opened via `admin edge start <profile>`, never via a hand-typed `microsoft-edge` invocation.
+- `edge-launch` (and the pre-existing `daemon` entrypoint) are top-level `hidden=True` Typer commands, deliberately outside the `do`/`admin` public surface: they exist only as `ExecStart=` targets for systemd, never meant to be typed by a human or agent directly. `hidden=True` means they never appear in `--help`; they are internal plumbing, not a third public command group.
 - Edge Workspace is inside a persistent Edge profile. Workspace identity is heuristic because no public Edge CDP or extension Workspace API exists.
 - The extension is published only through Microsoft Edge Add-ons; no Chrome compatibility or Chrome Web Store scope exists.
 - Secrets never appear in agent output, logs, autosaves, or daemon responses.
@@ -16,9 +27,9 @@
 
 ## Structure
 
-- `src/browser_proxy/`: Python daemon, JSON-RPC CLI, action registry, and direct CDP adapter.
+- `src/browser_proxy/`: Python daemon, JSON-RPC CLI, action registry, direct CDP adapter, and deterministic Edge profile path/port resolution (`paths.py`).
 - `browser-proxy-ext/`: independent TypeScript extension repository, tracked here as a git submodule.
-- `systemd/`: user socket/service units; source of truth for managed lifecycle.
+- `systemd/`: source of truth for every managed unit — `browser-proxy.service` (the daemon itself) and the single templated Edge unit, `browser-proxy-edge@.service` (one instance per profile, always visible). It intentionally omits `NoNewPrivileges` (unlike the daemon's own unit) so the SUID `chrome-sandbox` helper keeps working without `--no-sandbox`.
 
 ## Verification
 
