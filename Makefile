@@ -20,7 +20,7 @@ typecheck: ## Run strict static type checks
 smoke: ## Start an isolated daemon and prove a CLI Unix-socket roundtrip
 	@uv run browser-proxy --help
 	@uv run browser-proxy do --help
-	@state="$$(mktemp -d)"; export BROWSER_PROXY_STATE_DIR="$$state" BROWSER_PROXY_EXTENSION_PORT=39491 BROWSER_PROXY_IDLE_SECONDS=30; uv run browser-proxy daemon >/dev/null 2>&1 & pid=$$!; for attempt in {1..50}; do [[ -S "$$state/browser-proxy.sock" ]] && break; sleep 0.1; done; uv run browser-proxy do profile-list '{}'; uv run browser-proxy admin stop >/dev/null; wait $$pid; rmdir "$$state"
+	@state="$$(mktemp -d)"; export BROWSER_PROXY_STATE_DIR="$$state" BROWSER_PROXY_EXTENSION_PORT=39491; uv run browser-proxy daemon >/dev/null 2>&1 & pid=$$!; for attempt in {1..50}; do [[ -S "$$state/browser-proxy.sock" ]] && break; sleep 0.1; done; uv run browser-proxy do profile-list '{}'; uv run browser-proxy admin stop >/dev/null; wait $$pid; rmdir "$$state"
 
 check: lint typecheck test smoke ## Run all static checks, tests, and smoke checks
 

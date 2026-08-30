@@ -9,6 +9,5 @@ ExecStart=%h/.local/bin/browser-proxy daemon
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=2
-RuntimeMaxSec=8h
 TimeoutStopSec=30
 NoNewPrivileges=true

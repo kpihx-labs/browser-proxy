@@ -303,6 +303,31 @@ def edge_profile_state(path: Path) -> str:
     return "declared"
 
 
+def saved_windows_path(profile: str) -> Path:
+    """Purpose: return one profile's persisted saved-window snapshots file.
+
+    Args:
+        profile (str): Safe browser-proxy profile name — one file per profile, never shared.
+
+    Returns:
+        Path: ``<persistent_state_dir>/saved-windows/<profile>.json`` — the SAME durability class
+        as the extension pairing secret and the Edge profile root (survives reboot/logout), never
+        ``runtime_dir()`` (tmpfs). This is browser-proxy's OWN local "workspace" substitute (KπX,
+        GRAVÉ): real Edge Workspaces expose no public CDP or extension API at all (confirmed
+        live — see ``## Workspaces`` in ``CONTRACT.md``), so `window-save`/`window-restore` build
+        an honest, fully-owned equivalent instead of pretending to read what cannot be read.
+
+    Examples:
+        >>> saved_windows_path('default').name
+        'default.json'
+        >>> saved_windows_path('default').parent.name
+        'saved-windows'
+    """
+
+    validate_profile_name(profile)
+    return persistent_state_dir() / "saved-windows" / f"{profile}.json"
+
+
 def edge_cdp_port(name: str) -> int:
     """Purpose: derive a stable loopback CDP port for one named Edge profile.
 

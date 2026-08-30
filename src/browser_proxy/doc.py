@@ -17,18 +17,53 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
     "profile-start": {"profile": "default"},
     "profile-remove": {"profile": "test"},
     "window-list": {"profile": "default"},
-    "window-create": {"profile": "default", "url": "https://example.com"},
-    "window-close": {"profile": "default", "target_id": "<target-id>"},
+    "window-create": {
+        "profile": "default",
+        "layout": [{"type": "tab", "url": "https://example.com"}],
+    },
+    "window-close": {"profile": "default", "target_ids": ["<target-id>"]},
+    "window-sync": {
+        "profile": "default",
+        "window_id": 143985019,
+        "state": "maximized",
+        "layout": [{"type": "tab", "tab_id": 12}],
+    },
+    "window-save": {
+        "profile": "default",
+        "saves": [{"window_id": 143985019, "name": "Research"}],
+    },
+    "window-restore": {"profile": "default", "names": ["Research"]},
+    "window-saved-list": {"profile": "default"},
+    "window-saved-remove": {"profile": "default", "names": ["Research"]},
     "tab-list": {"profile": "default"},
-    "tab-create": {"profile": "default", "url": "https://example.com"},
+    "tab-get": {"profile": "default", "target_id": "<target-id>"},
+    "tab-create": {
+        "profile": "default",
+        "url": "https://example.com",
+        "window_id": 143985019,
+        "group_id": 1,
+    },
     "tab-activate": {"profile": "default", "target_id": "<target-id>"},
-    "page-list": {"profile": "default"},
-    "page-get": {"profile": "default", "target_id": "<target-id>"},
-    "workspace-list": {"profile": "default"},
+    "tab-update": {
+        "profile": "default",
+        "tab_id": 12,
+        "url": "https://example.com",
+        "group_id": 1,
+        "index": 0,
+    },
     "group-list": {"profile": "default"},
     "group-create": {"profile": "default", "tab_ids": [1, 2], "title": "Research"},
     "group-update": {"profile": "default", "group_id": 1, "title": "Research"},
     "group-move": {"profile": "default", "group_id": 1, "window_id": 2},
+    "group-add-tabs": {"profile": "default", "group_id": 1, "tab_ids": [3, 4]},
+    "group-remove-tabs": {"profile": "default", "tab_ids": [3, 4]},
+    "group-sync": {
+        "profile": "default",
+        "layout": [
+            {"type": "tab", "tab_id": 1},
+            {"type": "group", "title": "Research", "tab_ids": [2, 3]},
+        ],
+    },
     "bookmark-list": {"profile": "default"},
     "bookmark-create": {"profile": "default", "title": "Example", "url": "https://example.com"},
     "bookmark-remove": {"profile": "default", "id": "42"},
@@ -136,34 +171,129 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
                     "windowState": "normal",
                 },
                 "tabs": [{"id": "<target-id>", "type": "page"}],
+                "chrome_layout": {
+                    "tabs": [
+                        {
+                            "chrome_tab_id": 12,
+                            "index": 0,
+                            "url": "https://example.com",
+                            "title": "Example",
+                            "group_id": None,
+                            "active": True,
+                            "pinned": False,
+                            "target_id": "<target-id>",
+                        }
+                    ],
+                    "groups": {},
+                    "order": [{"kind": "tab", "chrome_tab_id": 12}],
+                },
             }
         ],
     },
     "window-create": {
         "profile": "default",
-        "url": "https://example.com",
-        "target_id": "<target-id>",
         "window_id": 143985019,
+        "layout": [{"type": "tab", "url": "https://example.com", "target_id": "<target-id>"}],
     },
-    "window-close": {"profile": "default", "target_id": "<target-id>", "closed": True},
-    "tab-list": {"profile": "default", "tabs": [{"id": "<target-id>", "type": "page"}]},
-    "tab-create": {"profile": "default", "target_id": "<target-id>", "url": "https://example.com"},
+    "window-close": {"profile": "default", "target_ids": ["<target-id>"], "closed": True},
+    "window-sync": {
+        "window_id": 143985019,
+        "state": "maximized",
+        "focused": True,
+        "layout": [{"type": "tab", "tab_id": 12}],
+    },
+    "window-save": {
+        "profile": "default",
+        "saved": [{"name": "Research", "window_id": 143985019, "tab_count": 3}],
+    },
+    "window-restore": {
+        "profile": "default",
+        "restored": [
+            {
+                "name": "Research",
+                "window_id": 143985340,
+                "layout": [
+                    {"type": "tab", "url": "https://example.com", "target_id": "<target-id>"}
+                ],
+            }
+        ],
+    },
+    "window-saved-list": {
+        "profile": "default",
+        "windows": [
+            {
+                "name": "Research",
+                "saved_at": "2026-08-30T11:40:00+00:00",
+                "bounds": {"left": 0, "top": 0, "width": 1928, "height": 912},
+                "tab_count": 3,
+                "layout": [{"type": "tab", "url": "https://example.com"}],
+            }
+        ],
+    },
+    "window-saved-remove": {"profile": "default", "removed": ["Research"]},
+    "tab-list": {
+        "profile": "default",
+        "tabs": [
+            {
+                "targetId": "<target-id>",
+                "type": "page",
+                "window_id": 143985019,
+                "group_id": None,
+                "group_title": None,
+            }
+        ],
+    },
+    "tab-get": {
+        "profile": "default",
+        "tab": {
+            "targetId": "<target-id>",
+            "type": "page",
+            "title": "Example Domain",
+            "url": "https://example.com",
+            "window_id": 143985019,
+            "group_id": 1,
+            "group_title": "Research",
+        },
+    },
+    "tab-create": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "url": "https://example.com",
+        "tab_id": 12,
+        "window_id": 143985019,
+        "group_id": 1,
+    },
     "tab-activate": {"profile": "default", "target_id": "<target-id>", "active": True},
-    "page-list": {
-        "profile": "default",
-        "pages": [{"id": "<target-id>", "url": "https://example.com"}],
+    "tab-update": {
+        "tab_id": 12,
+        "url": "https://example.com",
+        "index": 0,
+        "window_id": 143985019,
+        "group_id": 1,
     },
-    "page-get": {"profile": "default", "page": {"targetId": "<target-id>", "type": "page"}},
-    "workspace-list": {
-        "profile": "default",
-        "heuristic": True,
-        "authority": "none",
-        "workspaces": [],
+    "group-list": {
+        "groups": [
+            {
+                "id": 1,
+                "window_id": 143985019,
+                "title": "Research",
+                "color": "blue",
+                "collapsed": False,
+                "tabs": [{"id": 12, "url": "https://example.com", "title": "Example"}],
+            }
+        ]
     },
-    "group-list": {"groups": []},
     "group-create": {"group_id": 1, "title": "Research"},
     "group-update": {"id": 1, "title": "Research"},
     "group-move": {"group_id": 1, "window_id": 2},
+    "group-add-tabs": {"group_id": 1, "tab_ids": [3, 4]},
+    "group-remove-tabs": {"tab_ids": [3, 4], "ungrouped": True},
+    "group-sync": {
+        "layout": [
+            {"type": "tab", "tab_id": 1},
+            {"type": "group", "group_id": 2, "tab_ids": [2, 3]},
+        ]
+    },
     "bookmark-list": {"bookmarks": [{"id": "1", "title": "Favorites bar", "url": None}]},
     "bookmark-create": {"id": "42", "title": "Example", "url": "https://example.com"},
     "bookmark-remove": {"id": "42", "removed": True},
@@ -252,7 +382,11 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
 
 FIELD_NOTES: dict[str, str] = {
     "profile": "Managed Edge profile name. Defaults to `default` when omitted.",
-    "target_id": "CDP page target ID returned by `page-list`, `window-list`, or `tab-list`.",
+    "target_id": "CDP page target ID returned by `window-list`/`tab-list`/`tab-get`.",
+    "target_ids": (
+        "One or more CDP page target IDs (returned by `window-list`/`tab-list`/`tab-get`) to "
+        "close in this SAME call — never one separate call per target."
+    ),
     "url": "Absolute page URL.",
     "selector": "CSS selector resolved inside the selected page.",
     "text": "Text inserted into the focused element.",
@@ -289,6 +423,20 @@ FIELD_NOTES: dict[str, str] = {
     "timeout_seconds": "Maximum wait for the next created tab. Defaults to `15`.",
     "method": "Browser-level Chrome DevTools Protocol method.",
     "params": "Object-valued Chrome DevTools Protocol parameters.",
+    "tab_id": "Real numeric chrome.tabs.Tab ID (never a CDP target_id) to update/reposition.",
+    "index": "Absolute destination position: `0` is first, `-1` is last.",
+    "before_tab_id": "Move immediately before this real tab ID; its index is resolved server-side.",
+    "after_tab_id": "Move immediately after this real tab ID; its index is resolved server-side.",
+    "layout": (
+        'Ordered list to reorganize a whole window in one call: {"type":"tab","tab_id":N} or '
+        '{"type":"group","group_id":N (optional),"title":str,"color":str,"tab_ids":[N,...]}.'
+    ),
+    "new_window": "Whether to open a genuinely new Edge window instead of the current one.",
+    "bounds": 'Window bounds, any subset of {"left","top","width","height"} (real pixels).',
+    "state": '`"normal"`, `"maximized"`, `"minimized"`, `"fullscreen"`, or `"locked-fullscreen"`.',
+    "focused": "Whether the window should be given input focus.",
+    "saves": 'Non-empty list of {"window_id":N,"name":str} — several windows saved in ONE call.',
+    "names": "Non-empty list of saved window names — several restored/removed in ONE call.",
 }
 
 OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
@@ -302,7 +450,9 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "page-dialog-policy": ("prompt_text",),
     "cookie-set": ("path", "secure", "http_only"),
     "storage-local-get": ("key",),
-    "window-create": ("items",),
+    "tab-create": ("new_window", "window_id", "group_id", "index", "before_tab_id", "after_tab_id"),
+    "tab-update": ("url", "window_id", "group_id", "index", "before_tab_id", "after_tab_id"),
+    "window-sync": ("bounds", "state", "focused", "layout"),
     "group-create": ("color",),
     "group-update": ("title", "color", "collapsed"),
     "browser-ask-user": ("input_type",),
@@ -312,18 +462,30 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
-    (
-        "window-create",
-        "items",
-    ): (
-        "Ordered layout to build inside the new window in one call: a list of "
-        '{"type":"tab","url":"..."} or {"type":"group","title":"...","color":"...",'
-        '"tabs":["url1","url2",...]} objects, created in that exact order.'
-    ),
     ("page-console-list", "clear"): "Whether the captured console buffer is cleared after reading.",
     ("page-evaluate", "await_promise"): "Whether an expression returning a Promise is awaited.",
     ("cookie-set", "path"): "Cookie path. Defaults to `/`.",
     ("group-update", "collapsed"): "Whether the Edge tab group is collapsed.",
+    (
+        "tab-create",
+        "window_id",
+    ): "Open directly in this EXISTING window instead of a new one — mutually exclusive with `new_window`.",
+    (
+        "tab-create",
+        "group_id",
+    ): "Add the newly created tab into this EXISTING group/folder the instant it is created.",
+    (
+        "tab-update",
+        "window_id",
+    ): "Optional destination window (real numeric ID) to also move the tab across windows.",
+    (
+        "tab-update",
+        "group_id",
+    ): "Real numeric Edge tab-group ID to move this tab into, or explicit `null` to remove it from its group.",
+    (
+        "group-remove-tabs",
+        "tab_ids",
+    ): "Real numeric Edge tab IDs to remove from their group (never closed).",
     (
         "page-dialog-policy",
         "action",

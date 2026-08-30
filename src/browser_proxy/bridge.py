@@ -198,7 +198,14 @@ class ExtensionBridge:
         address = next(iter(self._server.sockets)).getsockname()
         return int(address[1])
 
-    async def request(self, kind: str, payload: dict[str, Any], profile: str) -> dict[str, Any]:
+    async def request(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        profile: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Purpose: dispatch a typed request to ONE specific profile's paired extension.
 
         Args:
@@ -207,6 +214,14 @@ class ExtensionBridge:
             payload (dict[str, Any]): Complete single action object to forward unchanged.
             profile (str): Target browser-proxy profile — the request is routed exclusively to
                 that profile's own connection, never to whichever extension happens to be attached.
+            timeout_seconds (float | None): Per-call override for how long THIS call waits for a
+                reply; ``None`` (the default, used by every non-approval typed request) keeps the
+                instance-wide ``self.timeout_seconds``. ``daemon._approve()`` passes an explicit
+                override here so the daemon-side wait is ALWAYS derived from the exact same
+                configured HITL timeout it tells the extension to honor (see
+                ``config.HITL_TIMEOUT_SECONDS_DEFAULT``) — never two independently hardcoded
+                numbers that can silently drift apart (root-caused live, KπX: the daemon used to
+                give up before a still-open, still-waiting-for-a-click overlay ever settled).
 
         Returns:
             dict[str, Any]: Typed extension reply with ``ok`` and object-valued ``data``.
@@ -232,7 +247,10 @@ class ExtensionBridge:
             json.dumps({"type": "request", "id": request_id, "kind": kind, "payload": payload})
         )
         try:
-            return await asyncio.wait_for(future, timeout=self.timeout_seconds)
+            return await asyncio.wait_for(
+                future,
+                timeout=timeout_seconds if timeout_seconds is not None else self.timeout_seconds,
+            )
         finally:
             self._pending.pop(request_id, None)
 

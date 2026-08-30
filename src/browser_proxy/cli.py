@@ -397,7 +397,14 @@ def admin_stop() -> None:
         None.
 
     Returns:
-        ``None`` after printing a shutdown envelope.
+        None: Sends the real ``shutdown`` RPC over the daemon's own Unix socket FIRST — this works
+        identically whether the daemon is systemd-managed or a raw background process (e.g.
+        ``make smoke``'s isolated test daemon), unlike ``systemctl stop`` alone, which silently
+        no-ops for a process systemd never launched (root-caused a real hang: the daemon has no
+        idle TTL to fall back on by design — KπX directive — so a stop that does nothing left the
+        test daemon running forever). Falls back to ``systemctl --user stop
+        browser-proxy.service`` only when the socket itself is unreachable (a genuinely hung or
+        already-dead daemon).
 
     Examples:
         >>> admin_stop.__name__
@@ -406,6 +413,10 @@ def admin_stop() -> None:
         True
     """
 
+    result = asyncio.run(request("shutdown", {}))
+    if result.meta.status == "ok":
+        _emit(result, None)
+        return
     _emit(_systemctl("stop", "browser-proxy.service"), None)
 
 

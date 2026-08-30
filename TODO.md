@@ -21,3 +21,13 @@
 - Live-verify `do profile-remove` against a real orphaned profile, and `admin edge status`'s new
   best-effort `extension_connected` field end-to-end (only unit-tested with mocked `systemctl`/CDP
   so far, per this codebase's existing pattern of never CliRunner-testing `admin edge *` commands).
+- Live-verify `window-list`'s `chrome_layout` (real `order`/`group_id`/`target_id` correlation),
+  `tab-move`, `group-add-tabs`, and `group-remove-tabs` against a real multi-group Edge window —
+  currently only unit/simulated-transport tested, not against a real paired extension.
+- Decide whether to also drop `@require_approval` from the pre-existing `group-create`/
+  `group-update`/`group-move` for consistency with the newer `tab-move`/`group-add-tabs`/
+  `group-remove-tabs`/`group-sync` (all directly-observable already-visible-browser manipulations)
+  — currently an unresolved asymmetry, left untouched pending an explicit decision.
+- Live-verify `do group-sync` against a real multi-group Edge window (only unit/simulated-transport
+  tested so far), and the new HITL transparency/redirection/temp-tab-cleanup fixes end-to-end
+  against a real paired extension.

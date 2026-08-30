@@ -4,13 +4,18 @@ import asyncio
 import os
 import socket
 import subprocess
-from time import monotonic
 from typing import Any
 
 import shutil
 
 from browser_proxy import config
-from browser_proxy.actions import REGISTRY, validate_registry
+from browser_proxy.actions import (
+    REGISTRY,
+    _profile,
+    format_window_preview,
+    validate_registry,
+    windows_preview_for_targets,
+)
 from browser_proxy.bridge import ExtensionBridge
 from browser_proxy.cdp import CdpBrowser, is_read_only_method
 from browser_proxy.models import Envelope, RpcRequest
@@ -26,54 +31,55 @@ from browser_proxy.paths import (
 )
 from browser_proxy.profile_state import describe_edge_profile, edge_unit_name, is_edge_unit_active
 
+_APPROVAL_BRIDGE_GRACE_SECONDS = 5.0
+"""Extra seconds the daemon-side bridge wait adds ON TOP of the exact HITL timeout it tells the
+extension to honor — guarantees the daemon can never give up a hair before the extension's own
+alarm-based expiry could legitimately still fire and reply (see ``Daemon._approve``)."""
+
 
 class Daemon:
     """Own local transport, Edge profile processes, policy, and extension bridge."""
 
-    def __init__(
-        self, idle_seconds: int | None = None, max_lifetime_seconds: int | None = None
-    ) -> None:
+    def __init__(self) -> None:
         """Purpose: initialize daemon lifecycle, profile, and extension bridge state.
 
         Args:
-            idle_seconds (int | None): Idle TTL override; environment default when absent.
-            max_lifetime_seconds (int | None): Hard lifetime override; environment default when absent.
+            None.
 
         Returns:
             None: Creates an unstarted daemon; persistent profile identity remains on disk.
 
+        Notes:
+            Deliberately no idle TTL and no maximum lifetime (KπX directive): the daemon is
+            lançable/arrêtable purely on request — `admin start`/`admin stop`, or the OS itself —
+            never on an automatic timer. Every managed Edge window is already always visible, so
+            KπX can directly see and close one an agent forgot; there is no case where an
+            unattended timeout is the right way to reclaim it.
+
         Examples:
-            >>> Daemon(idle_seconds=5).idle_seconds
-            5
-            >>> Daemon(max_lifetime_seconds=10).bridge.connected
+            >>> isinstance(Daemon()._stop, asyncio.Event)
+            True
+            >>> Daemon().bridge.connected
             False
         """
-        self.idle_seconds = idle_seconds or int(
-            os.environ.get(config.ENV_IDLE_SECONDS, str(config.IDLE_SECONDS_DEFAULT))
-        )
-        self.max_lifetime_seconds = max_lifetime_seconds or int(
-            os.environ.get(
-                config.ENV_MAX_LIFETIME_SECONDS, str(config.MAX_LIFETIME_SECONDS_DEFAULT)
-            )
-        )
         self._stop = asyncio.Event()
-        self._last_work = monotonic()
         self.bridge = ExtensionBridge()
 
     async def serve(self) -> None:
-        """Purpose: serve requests on systemd's or a private Unix socket until shutdown.
+        """Purpose: serve requests on systemd's or a private Unix socket until explicitly stopped.
 
         Args:
             self (Daemon): Daemon instance owning lifecycle state and local transports.
 
         Returns:
-            None: Stops only after an idle, lifetime, or explicit shutdown event.
+            None: Stops ONLY on an explicit ``admin stop``/``shutdown`` RPC (or the process being
+            killed) — no idle TTL, no maximum lifetime (KπX directive: purely lançable/arrêtable).
 
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon.serve)
             True
-            >>> Daemon(idle_seconds=1).idle_seconds
-            1
+            >>> isinstance(Daemon()._stop, asyncio.Event)
+            True
         """
         validate_registry()
         runtime_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -90,7 +96,7 @@ class Daemon:
                 local_socket.chmod(0o600)
             else:
                 server = await asyncio.start_unix_server(self._handle, sock=activated)
-            await asyncio.gather(server.serve_forever(), self._lifecycle())
+            await asyncio.gather(server.serve_forever(), self._await_explicit_stop())
         except RuntimeError as error:
             if str(error) != "DAEMON_STOP":
                 raise
@@ -135,7 +141,7 @@ class Daemon:
         Examples:
             >>> callable(Daemon._acquire_lock)
             True
-            >>> isinstance(Daemon()._last_work, float)
+            >>> isinstance(Daemon()._stop, asyncio.Event)
             True
         """
         try:
@@ -152,36 +158,31 @@ class Daemon:
         os.close(fd)
         return True
 
-    async def _lifecycle(self) -> None:
-        """Purpose: stop after the configured idle or maximum-lifetime limit.
+    async def _await_explicit_stop(self) -> None:
+        """Purpose: block until an explicit stop is requested — the ONLY way this daemon stops.
 
         Args:
-            self (Daemon): Daemon whose activity timestamps, bridge connection, and stop event
-                are monitored.
+            self (Daemon): Daemon whose stop event is awaited.
 
         Returns:
-            None: Raises the internal ``DAEMON_STOP`` signal after setting stop state. The idle
-            timer is suspended entirely while an authenticated extension is connected — a paired,
-            idle-but-connected extension must never be force-disconnected just because no CLI
-            command happened to run in the last ``idle_seconds`` (previously the daemon stopped
-            regardless, silently dropping a healthy bridge connection). ``max_lifetime_seconds``
-            still applies unconditionally as the hard, unavoidable ceiling.
+            None: Raises the internal ``DAEMON_STOP`` signal once ``self._stop`` is set by the
+            ``shutdown`` RPC (``admin stop``).
+
+        Notes:
+            Deliberately no idle TTL, no maximum lifetime (KπX directive, root-caused a real
+            complaint: an idle-suspended-while-connected TTL still resumed and killed the whole
+            daemon — CDP included — the instant the extension bridge dropped for any unrelated
+            reason). Every managed Edge window is already always visible, so KπX can directly see
+            and close one an agent forgot; there is no case where an unattended timeout is the
+            right way to reclaim it. The daemon is purely lançable/arrêtable on request.
 
         Examples:
-            >>> asyncio.iscoroutinefunction(Daemon._lifecycle)
+            >>> asyncio.iscoroutinefunction(Daemon._await_explicit_stop)
             True
-            >>> Daemon(idle_seconds=1).idle_seconds
-            1
+            >>> Daemon()._stop.is_set()
+            False
         """
-        started = monotonic()
-        while not self._stop.is_set():
-            await asyncio.sleep(0.2)
-            lifetime_expired = monotonic() - started >= self.max_lifetime_seconds
-            idle_expired = (
-                not self.bridge.connected and monotonic() - self._last_work >= self.idle_seconds
-            )
-            if lifetime_expired or idle_expired:
-                self._stop.set()
+        await self._stop.wait()
         raise RuntimeError("DAEMON_STOP")
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -396,15 +397,46 @@ class Daemon:
             True
             >>> Daemon().bridge.connected
             False
+
+        Notes:
+            Root-caused live (KπX): a rejection used to always report the bare code
+            ``APPROVAL_REJECTED`` with an empty message, indistinguishable whether a real human
+            clicked "deny", the extension's own alarm genuinely timed out, or the extension could
+            not even DISPLAY the overlay at all (a technical delivery failure, e.g. every candidate
+            tab's content script was stale right after an extension reload) — this now raises one
+            of three distinct codes (``APPROVAL_REJECTED``/``APPROVAL_TIMEOUT``/
+            ``APPROVAL_UNAVAILABLE``) carrying the extension's REAL diagnostic message, never
+            silently discarded. Also fixed the exact bug KπX caught live: the daemon-side wait used
+            to be a SEPARATE hardcoded ``600`` never actually read from anywhere configurable, now
+            derived from the single ``config.HITL_TIMEOUT_SECONDS_DEFAULT``/
+            ``config.ENV_HITL_TIMEOUT_SECONDS`` source of truth, with a small fixed grace margin on
+            the daemon's own wait so it can never expire before the extension's own alarm does.
         """
         profile = str(payload.get("profile", "default"))
-        reply = await self.bridge.request(
-            "approval",
-            {"action": action, "payload": payload, "timeout_seconds": 600},
-            profile,
+        hitl_timeout = float(
+            os.environ.get(
+                config.ENV_HITL_TIMEOUT_SECONDS, str(config.HITL_TIMEOUT_SECONDS_DEFAULT)
+            )
         )
+        try:
+            reply = await self.bridge.request(
+                "approval",
+                {"action": action, "payload": payload, "timeout_seconds": hitl_timeout},
+                profile,
+                timeout_seconds=hitl_timeout + _APPROVAL_BRIDGE_GRACE_SECONDS,
+            )
+        except TimeoutError as error:
+            raise PermissionError(
+                "APPROVAL_TIMEOUT: daemon gave up waiting for the extension's reply"
+            ) from error
         if not reply.get("ok"):
-            raise PermissionError("APPROVAL_REJECTED")
+            data = reply.get("data", {})
+            message = str(data.get("message", "")) if isinstance(data, dict) else ""
+            decision = str(data.get("decision", "")) if isinstance(data, dict) else ""
+            code = {"rejected": "APPROVAL_REJECTED", "timeout": "APPROVAL_TIMEOUT"}.get(
+                decision, "APPROVAL_UNAVAILABLE"
+            )
+            raise PermissionError(f"{code}: {message}" if message else code)
         data = reply.get("data", {})
         if not isinstance(data, dict) or data.get("decision") != "approved":
             raise PermissionError("APPROVAL_REJECTED")
@@ -412,6 +444,49 @@ class Daemon:
         if not isinstance(edited, dict):
             raise PermissionError("APPROVAL_REJECTED")
         return edited, str(data.get("comment", "")), edited != payload
+
+    async def _target_approval_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Purpose: enrich ANY approval payload carrying CDP ``target_id``/``target_ids`` with
+        per-window first/last context — centralized for EVERY gated action, never a
+        ``window-close``-only special case.
+
+        Args:
+            self (Daemon): Daemon instance, unused beyond profile resolution (mirrors ``_profile``'s
+                own ``DaemonContext`` shape).
+            payload (dict[str, Any]): The real gated-action payload about to be approved — may be
+                ``window-close`` (``target_ids`` list), ``tab-activate``/``storage-local-set``
+                (singular ``target_id``), or any future action using either field.
+
+        Returns:
+            dict[str, Any]: The SAME payload plus one extra ``"context"`` field — a list of
+            human-readable ``format_window_preview()`` lines, one per REAL window touched by the
+            resolved target(s) — so the HITL overlay always shows first/last tab titles instead of
+            opaque CDP target ids alone (KπX root-caused live: "je ne connais pas quel id
+            correspond à quel window"). Returns the ORIGINAL, unenriched payload untouched when
+            neither field is present, is malformed, or the profile/CDP connection is unavailable —
+            the real validation/connection error still surfaces normally once the actual handler
+            runs afterward; enrichment failure never blocks the real action.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(Daemon._target_approval_preview)
+            True
+            >>> callable(Daemon._target_approval_preview)
+            True
+        """
+        raw_target_ids = payload.get("target_ids")
+        single_target_id = payload.get("target_id")
+        if isinstance(raw_target_ids, list) and raw_target_ids:
+            target_ids = [str(value) for value in raw_target_ids]
+        elif single_target_id not in (None, ""):
+            target_ids = [str(single_target_id)]
+        else:
+            return payload
+        try:
+            _, browser = _profile(payload, self)
+            previews = await windows_preview_for_targets(browser, target_ids)
+        except RuntimeError:
+            return payload
+        return {**payload, "context": [format_window_preview(preview) for preview in previews]}
 
     async def dispatch(self, request: RpcRequest) -> Envelope:
         """Purpose: dispatch health, administration, or registered browser actions.
@@ -438,7 +513,6 @@ class Daemon:
                     "extension_connected_profiles": list(self.bridge.connected_profiles()),
                 }
             )
-        self._last_work = monotonic()
         if request.method == "shutdown":
             self._stop.set()
             return Envelope.ok({"stopping": True})
@@ -470,7 +544,8 @@ class Daemon:
                 action.name == "raw" and not is_read_only_method(raw_method)
             )
             if requires_approval:
-                payload, comment, edited = await self._approve(action.name, payload)
+                approval_payload = await self._target_approval_preview(payload)
+                payload, comment, edited = await self._approve(action.name, approval_payload)
             result = await action.handler(payload, self)
             for field in action.policy.verification:
                 if field in payload and result.get(field) != payload[field]:
@@ -482,12 +557,21 @@ class Daemon:
                 }
             return Envelope.ok(result, comment=comment, edited=edited)
         except PermissionError as error:
-            return Envelope.error(str(error))
+            code = str(error).split(":", 1)[0]
+            if code not in {"APPROVAL_REJECTED", "APPROVAL_TIMEOUT", "APPROVAL_UNAVAILABLE"}:
+                code = "APPROVAL_REJECTED"
+            return Envelope.error(code, message=str(error))
         except ValueError as error:
             code = "RAW_METHOD_DENIED" if str(error) == "RAW_METHOD_DENIED" else "VALIDATION_ERROR"
             return Envelope.error(code, message=str(error))
         except RuntimeError as error:
             code = str(error).split(":", 1)[0]
-            if code not in {"CDP_UNAVAILABLE", "EXTENSION_UNAVAILABLE", "PROFILE_UNAVAILABLE"}:
+            known_codes = {
+                "CDP_UNAVAILABLE",
+                "EXTENSION_UNAVAILABLE",
+                "PROFILE_UNAVAILABLE",
+                "NOT_FOUND",
+            }
+            if code not in known_codes:
                 code = "CDP_UNAVAILABLE"
             return Envelope.error(code, message=str(error))

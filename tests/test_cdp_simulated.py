@@ -134,7 +134,8 @@ def test_raw_read_only_bypasses_approval_but_mutation_is_approved(monkeypatch, t
 def test_registry_covers_full_profile_hierarchy_and_object_payload_contract() -> None:
     """The public action registry names all supported Edge profile resource domains."""
     groups = {action.group for action in REGISTRY.values()}
-    assert {"Profiles", "Workspaces", "Windows", "Groups", "Tabs", "Bookmarks"} <= groups
+    assert {"Profiles", "Windows", "Groups", "Tabs", "Bookmarks"} <= groups
+    assert "Workspaces" not in groups
     assert REGISTRY["raw"].policy.approval is False
 
 

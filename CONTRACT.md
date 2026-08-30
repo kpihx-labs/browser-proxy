@@ -1,12 +1,28 @@
 # browser-proxy — Architecture Contract
 
-> **Status:** 🟢 ACTIVE — v0.5.0. Edge-only. Single binary, namespaced CLI: `do`/`admin`. 50 registered
-> `do` actions. Direct CDP is the default transport; the paired Edge extension is a privileged
-> fallback + human-in-the-loop surface, multiplexed per profile (see `## Extension bridge
+> **Status:** 🟢 ACTIVE — v0.5.0. Edge-only. Single binary, namespaced CLI: `do`/`admin`. 54 registered
+> `do` actions (`page-list`/`page-get` purged and merged into `tab-list`/`tab-get`; `tab-move`
+> renamed `tab-update`; `window-sync` added — KπX, GRAVÉ: "tab = page... je ne veux pas de
+> duplication inutile"). Direct CDP is the default transport; the paired Edge extension is a
+> privileged fallback + human-in-the-loop surface, multiplexed per profile (see `## Extension bridge
 > identity`). Every managed Edge instance is always visible (no headless mode exists — see
 > `## Edge lifecycle`). Profile lifecycle (state, systemd, CDP) is computed by ONE canonical
 > function, `profile_state.describe_edge_profile()` — never duplicated per caller (see
-> `## Profile lifecycle management`).
+> `## Profile lifecycle management`). Tab/group structure (order, membership, movement) is computed
+> by ONE canonical function, `computeWindowLayouts()` — never a patched-on-afterward second view
+> (see `## Canonical tab/group structure`); `tab-list`/`tab-get` now surface each tab's REAL
+> `window_id`/`group_id`/`group_title` from that SAME computation. The daemon has deliberately NO
+> automatic timeout (idle TTL or maximum lifetime) — purely lançable/arrêtable on request (KπX
+> directive, see `## Daemon lifecycle`). Every HITL prompt (approval or otherwise) is shown in a
+> real, FOCUSED tab — never one KπX has to discover by accident — and shows the REAL non-secret
+> proposal details PLUS resolved native-id illustrations (a group's current name+tabs, a window's
+> real tabs, each tab's real title/url — never opaque ids alone), with a single configurable timeout
+> (`config.HITL_TIMEOUT_SECONDS_DEFAULT`, `BROWSER_PROXY_HITL_TIMEOUT_SECONDS`) shared by the daemon
+> and the extension so neither can give up before the other (KπX directive: 100% transparency,
+> "human readable... intuitif"; see `## HITL transparency and redirection`). `do group-sync`/
+> `do window-sync` (new) reorganize a whole window's tab/group layout — create, rename, recolor,
+> add-to, remove-from, and reposition — in ONE call, now BOTH `@require_approval`-gated (KπX
+> directive, GRAVÉ reversal: absolute flexibility, but reviewable).
 
 ---
 
@@ -79,9 +95,10 @@ browser-proxy admin <command>                                              # lif
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `window-list` | `Target.getTargets` (filtered to `type=="page"`, via shared `_page_targets()`) then ONE `Browser.getWindowForTarget` per tab, grouped by the real returned `windowId` | ❌ | Returns `{"windows": [{"window_id", "bounds", "tabs": [...]}]}` — never a flat target list (see `## Window grouping`); `tab-list`/`page-list`/`workspace-list` use the shared `_page_targets()` flat helper directly, independent of this grouping |
-| `window-create` | `Target.createTarget` (`newWindow: true`), then `Browser.getWindowForTarget` for the real `window_id`, then (optional) `items` layout — see `## Window layout` | ❌ preflight `profile` + verify `url` | Deliberately NOT approval-gated — every managed Edge window is already always real and visible (never headless), so opening one is directly observable the instant it happens; no hidden side effect for an overlay to meaningfully gate |
-| `window-close` | `Target.closeTarget` | ✅ preflight `profile`,`target_id` | |
+| `window-list` | `Target.getTargets` (filtered to `type=="page"`, via shared `_page_targets()`) then ONE `Browser.getWindowForTarget` per tab, grouped by the real returned `windowId`; plus, when the extension is connected, bridge kind `window.layout` merged in as `chrome_layout` | ❌ | Returns `{"windows": [{"window_id", "bounds", "tabs": [...], "chrome_layout": {...}|null}]}` — never a flat target list (see `## Window grouping` and `## Canonical tab/group structure`); `tab-list` reuses this SAME computation by flattening it, independent of `window-list`'s own grouped shape |
+| `window-create` | `Target.createTarget` (`newWindow: true`), then `Browser.getWindowForTarget` for the real `window_id`, then (optional) `layout` — see `## Window layout` | ❌ preflight `profile` + verify `url` | Deliberately NOT approval-gated — every managed Edge window is already always real and visible (never headless), so opening one is directly observable the instant it happens; no hidden side effect for an overlay to meaningfully gate |
+| `window-close` | `Target.closeTarget` (one call per `target_id`, all in ONE approval) | ✅ preflight `profile`,`target_ids` | `target_ids` is a LIST — closing several tabs/windows across the profile is ONE deliberate command with ONE approval, never N separate calls each needing its own round-trip (root-caused, KπX: too slow/tedious in practice) |
+| `window-sync` | bridge kind `window.update` (bounds/state/focused) and/or bridge kind `group.sync` (layout) — see `## Window layout` | ✅ preflight `profile`,`window_id` | The window-level equivalent of `group-sync` (KπX: "très complet et flexible"): adjust an EXISTING window's own bounds/state/focus AND/OR reorganize its whole tab/group `layout`, all in one call, one approval |
 
 ### Window grouping — `window-list` reports real windows, not a flat target list
 
@@ -100,15 +117,96 @@ the one real CDP signal for window identity — and grouping by its returned `wi
 ]}
 ```
 
-`tab-list`, `page-list`, and `workspace-list` never depended on `window-list`'s shape in the first
-place except `tab-list` (which used to literally call `_window_list()` and rename its key) — all 4
-actions now share one flat-listing helper, `_page_targets(browser)`, so the SAME
-`Target.getTargets`-filtering logic is never duplicated a 4th time, and `tab-list` stays flat and
-independent of `window-list`'s grouping.
+`tab-list` now DELIBERATELY reuses `window-list`'s full computation via `_tabs_with_context()`
+(KπX, GRAVÉ: "tab-list doit indiquer ds quel fenêtre est la tab, ds quel dossier c'est si c'est ds
+un dossier") — it flattens `window-list`'s grouped windows back into a flat per-tab list, each tab
+carrying `window_id` (which real window it lives in) and `group_id`/`group_title` (which real
+group/folder it's in, both `null` if ungrouped or the extension is unavailable — an honest
+degradation, never a silent guess). `tab-get` (new, replacing `page-get` — see `## Tabs`) shares the
+SAME helper for a single tab, merged with the raw `Target.getTargetInfo` CDP metadata.
+## Canonical tab/group structure — one real truth, three views (KπX refonte)
 
-### Window layout — build a whole tab/group setup in one `window-create` call
+**Root-caused bug (fixed):** `tab-list` used to be a flat list of raw CDP targets with zero
+awareness of tab groups; `group-list` was a completely separate extension-sourced view with its
+own numeric ids. There was no way to answer "which tab is in which group" or "what is the real
+visual order" without manually cross-referencing two disjoint views — because CDP (`Target.
+getTargets`) and Chromium's own tab-group model are two genuinely disconnected systems: CDP has no
+concept of tab groups or tab `index` at all (that's UI-layer state, invisible to the debugging
+protocol); only `chrome.tabs.query`/`chrome.tabGroups.query` (extension-side) can answer it. Patching
+group hints onto a CDP-only list after the fact could never be more than a superficial fix.
 
-`window-create`'s optional `items` field is an ordered list, each entry either:
+**The fix starts from Chromium's actual model, not a filesystem-folder metaphor.** A window is one
+ORDERED sequence of tabs (real `index`); a group is not a container, it is a label
+(`tab.groupId`) on a CONTIGUOUS run of that same sequence — Chromium enforces contiguity, there are
+no nested groups. `computeWindowLayouts()` (`background.ts`) computes this ONE real truth in a
+single pass (`chrome.tabs.query({})` + `chrome.tabGroups.query({})`, joined and sorted by real
+`index`), and every action below only ever reads or mutates that SAME state — never a second,
+independently-fetched copy:
+
+```json
+{
+  "window_id": 143985169,
+  "tabs": [
+    {"chrome_tab_id": 111, "index": 0, "url": "...", "title": "...", "group_id": null, "active": false, "pinned": false},
+    {"chrome_tab_id": 112, "index": 1, "url": "...", "title": "...", "group_id": 505967183, "active": false, "pinned": false}
+  ],
+  "groups": {"505967183": {"title": "Research", "color": "blue", "collapsed": false}},
+  "order": [
+    {"kind": "tab", "chrome_tab_id": 111},
+    {"kind": "group", "group_id": 505967183, "title": "Research", "color": "blue", "collapsed": false, "tabs": [112]}
+  ]
+}
+```
+
+**Absolute flexibility from one source, not three independently-maintained ones:**
+- **`tabs`** answers "what group is THIS tab in" directly (`group_id`, `null` if ungrouped) — flat,
+  ordered by real `index`.
+- **`groups`** is pure per-group metadata (title/color/collapsed), never duplicated tab data.
+- **`order`** answers "what does Edge actually show, left to right" — standalone tabs interleaved
+  with contiguous group blocks, each carrying its own member tab ids — the exact visual layout, not
+  a reconstruction.
+
+All three are PURE PROJECTIONS of the identical `chrome.tabs.query`/`chrome.tabGroups.query`
+snapshot, computed once per call — never three sources that could drift apart.
+
+**Where this surfaces:**
+- **`window-list`** gained `chrome_layout: {tabs, groups, order} | null` per window (`window.layout`
+  bridge kind, all windows fetched in one call) — `null` only when the extension is not connected
+  for that profile (CDP alone cannot answer this; an honest degradation, never a silent guess). The
+  pre-existing CDP-only `tabs` field is untouched (100% backward compatible); each `chrome_layout`
+  tab additionally carries a best-effort `target_id` (see the ID-bridging note below).
+- **`group-list`** now derives from the SAME `computeWindowLayouts()` (previously its own separate
+  `chrome.tabGroups.query`+`chrome.tabs.query({groupId})` calls) and gained `window_id`/`collapsed`
+  — additive, the pre-existing `id`/`title`/`color`/`tabs` shape is unchanged.
+
+**The ID-bridging problem, solved honestly, not hidden:** CDP `target_id` (opaque devtools string)
+and `chrome.tabs.Tab.id` (real stable integer) are two genuinely separate identifier systems with
+NO first-class mapping between them anywhere in Chromium's public surface. `_correlate_cdp_targets()`
+pairs them by matching URL in left-to-right encounter order on BOTH sides — exact when each URL is
+open once, and deterministic even for duplicate URLs (Nth occurrence pairs with Nth occurrence,
+never an ambiguous first-match guess); `target_id` is `null` when nothing matches. This is why the
+mutation actions below (`tab-update`, `group-add-tabs`, `group-remove-tabs`) all address tabs by
+their REAL `chrome_tab_id` — never a CDP `target_id`, which `chrome.tabs.*` cannot accept at all.
+
+### Moving and regrouping tabs — the same primitives a mouse drag performs
+
+| Action | Backend | Approval | Notes |
+|---|---|---|---|
+| `tab-update` | bridge kind `tab.update` — `chrome.tabs.update` (url), `chrome.tabs.group`/`ungroup` (group_id), `chrome.tabs.move` (position/window), applied in that fixed order | ❌ preflight `tab_id` | Renamed from `tab-move` (KπX, GRAVÉ: "renomme en tab-update... url, window, folder, index... centralise vraiment tout cela pour redistribuer partout cette philo de fin ajustement"). ANY combination of `url`, `window_id`, `group_id` (`null` removes from group), and AT MOST ONE of `index`/`before_tab_id`/`after_tab_id` — at least one field beyond `tab_id` required, never a silent no-op |
+| `group-add-tabs` | `chrome.tabs.group({tabIds, groupId})` | ❌ preflight `group_id` | Adds tabs to an ALREADY-CREATED group — never creates a new one (that's `group-create`) |
+| `group-remove-tabs` | `chrome.tabs.ungroup` | ✅ preflight `tab_ids` | Removes tabs from their group WITHOUT closing them |
+| `group-sync` | `chrome.tabs.group`/`ungroup`/`move` + `chrome.tabGroups.update`/`move` in one pass — see `## HITL transparency and redirection` | ✅ preflight `layout` | Reorganizes a WHOLE window's layout (`{"layout": [...]}}`) in ONE call — create, rename, recolor, add-to, remove-from, and reposition, all at once |
+
+`tab-update`/`group-add-tabs` stay **NOT** `@require_approval`-gated — repositioning/regrouping an
+already-visible tab is directly observable the instant it happens, the same rationale already
+applied to `window-create`/`tab-create`. `group-remove-tabs` and `group-sync` are now **gated**
+(KπX directive, GRAVÉ — a reversal of their original "directly observable" stance), same treatment
+as `group-create`/`group-update`/`group-move`/`window-sync`: reorganizing a whole window/group's
+structure is now always a deliberate, reviewable command.
+
+### Window layout — build/reorganize a whole tab/group setup in one `layout` field
+
+`window-create`'s (and `window-sync`'s) `layout` field is an ordered list, each entry either:
 
 ```json
 {"type": "tab", "url": "https://a.example"}
@@ -116,7 +214,7 @@ independent of `window-list`'s grouping.
 ```
 
 Processed strictly in the given order — one tab, then a group of N tabs, then another tab, and so
-on — every one landing in the SAME new window via its real `window_id` (`Target.createTarget`'s
+on — every one landing in the SAME window via its real `window_id` (`Target.createTarget`'s
 `windowId` parameter, resolved once via `Browser.getWindowForTarget` right after the window opens
 — see `## Window grouping`). A `group` entry's tabs are created first, then `chrome.tabs.group` is
 called once with their **real chrome tab ids** — never CDP `target_id` strings, which
@@ -126,42 +224,51 @@ mechanism `browser-get-new-tab` already exposes standalone (`tab.capture_next`):
 (`_create_window_tab()`), so the daemon never guesses which numeric id belongs to which target.
 
 Grouping therefore still requires the paired extension (fails closed with `EXTENSION_UNAVAILABLE`
-if it cannot capture a real id) — plain `tab` items never do, since they only need direct CDP.
-**No individual approval per item**: because `window-create` itself is approval-free (see above),
-every tab/group created through `items` bypasses `tab-create`'s/`group-create`'s own standalone
-approval gates too — the whole layout is one single deliberate command, not a series of separately
-approved ones. Response shape: `{"profile", "url", "target_id", "window_id", "items": [...]}` —
-`items` is present only when the payload supplied one.
+if it cannot capture a real id) — plain `tab` entries never do, since they only need direct CDP.
+**No individual approval per entry** for `window-create` (itself approval-free): every tab/group
+created through its `layout` bypasses `tab-create`'s/`group-create`'s own standalone approval gates
+too — the whole layout is one single deliberate command, not a series of separately approved ones.
+`window-sync`'s own `layout` field, by contrast, IS covered by `window-sync`'s own single approval
+(the whole action is gated, see `## Windows`). Response shape (`window-create`):
+`{"profile", "window_id", "layout": [...]}` — `layout` is present only when the payload supplied
+one.
 
 #### Tabs
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `tab-list` | `Target.getTargets` via shared `_page_targets()` — flat, independent of `window-list`'s grouping | ❌ | |
-| `tab-create` | `Target.createTarget` | ❌ preflight `profile` + verify `url` | optional `new_window`; deliberately NOT approval-gated, same rationale as `window-create` — opening a tab in an always-visible window is directly observable |
-| `tab-activate` | `Target.activateTarget` | ✅ preflight `profile`,`target_id` | |
+| `tab-list` | reuses `window-list`'s FULL computation, flattened per tab — see `## Window grouping` | ❌ | Each tab carries `window_id` and `group_id`/`group_title` (both `null` if ungrouped/extension unavailable) — root-caused live (KπX): a flat tab list with zero window/folder context gave no way to recognize which tab is which |
+| `tab-get` | same flattened view (matched by `target_id`) merged with raw `Target.getTargetInfo` | ❌ | Replaces `page-get` (KπX, GRAVÉ: "tab = page... je ne veux pas de duplication inutile" — `page-get` was a second, narrower "get one tab's identity" action with zero window/group context; merged here as the single comprehensive source). Fails closed (`CDP_UNAVAILABLE`) for an unknown `target_id` |
+| `tab-create` | `Target.createTarget` (optionally `windowId`/`newWindow`), then (only if `group_id`/position requested) bridge kind `tab.update` to place the captured real chrome tab id | ❌ preflight `profile` + verify `url` | As fine-grained as possible (KπX, GRAVÉ: "on doit être le plus fin possible... donner l'illusion d'un aspect esthétique visuel, pas juste créer du bullshit"): optional `window_id` (open in an EXISTING window — mutually exclusive with `new_window`), optional `group_id` (add to an EXISTING group the instant it's created), optional `index`/`before_tab_id`/`after_tab_id`. Deliberately NOT approval-gated, same rationale as `window-create` |
+| `tab-activate` | `Target.activateTarget` | ❌ preflight `profile`,`target_id` | **No longer approval-gated** (KπX directive, GRAVÉ reversal): activating an already-open, already-visible tab is directly observable the instant it happens. Its role is purely navigational focus — bring a specific already-open tab to the front (e.g. before a screenshot/interaction, or to surface a background tab) — it never creates/closes/mutates content |
+| `tab-update` | bridge kind `tab.update` — see `## Moving and regrouping tabs` | ❌ preflight `tab_id` | Renamed from `tab-move`. Addresses the REAL `chrome_tab_id`, never a CDP `target_id` |
 
-#### Pages
+#### Edge Workspaces — deliberately not implementable
 
-| Action | Backend | Approval | Notes |
-|---|---|---|---|
-| `page-list` | `Target.getTargets` | ❌ | |
-| `page-get` | `Target.getTargetInfo` | ❌ | |
+No `workspace-*` command belongs to the public `do` surface. The former `workspace-list` was
+removed: it only relabeled every CDP page target as one heuristic `ungrouped` container, so it did
+not represent Edge Workspaces and would have been misleading.
 
-#### Workspaces
-
-| Action | Backend | Approval | Notes |
-|---|---|---|---|
-| `workspace-list` | `Target.getTargets`, grouped client-side | ❌ | `heuristic: true, authority: "none"` — Edge exposes no public Workspace API |
+This boundary is established and must not be reinvestigated unless Microsoft Edge ships a supported
+API. Neither Edge CDP nor the Chrome/Edge extension APIs expose native Workspace identity,
+membership, creation, restoration, or switching. The historical `WorkspacesCache` reader has no
+cache to read in the current Edge profile. Current local sync artefacts expose a boolean
+`workspaces.has_workspace` preference and opaque `edge_workspace-md-<uuid>` LevelDB records, but
+not a documented, stable, or safely writable protocol. Native Workspace operations therefore remain
+outside browser-proxy; use the visible Edge UI directly. Browser-proxy's supported hierarchy is
+profiles → windows → tabs → tab groups.
 
 #### Groups (extension-mediated — `_extension(payload, context, kind)` → `Daemon.extension_request`)
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `group-list` | bridge kind `group.list` | ❌ | heuristic, non-authoritative unless the extension returns a real `chrome.tabGroups` id |
+| `group-list` | bridge kind `group.list`, derived from the same `computeWindowLayouts()` as `window-list`'s `chrome_layout` — see `## Canonical tab/group structure` | ❌ | real `chrome.tabGroups` id, now also carries `window_id`/`collapsed` |
 | `group-create` | bridge kind `group.create` | ✅ verify `title` | |
 | `group-update` | bridge kind `group.update` | ✅ preflight `group_id` | |
 | `group-move` | bridge kind `group.move` | ✅ preflight `group_id` | |
+| `group-add-tabs` | bridge kind `group.add_tabs` — see `## Canonical tab/group structure` | ❌ preflight `group_id` | adds to an EXISTING group, never creates one |
+| `group-remove-tabs` | bridge kind `group.remove_tabs` — see `## Canonical tab/group structure` | ✅ preflight `tab_ids` | ungroups without closing — now gated (KπX directive, GRAVÉ reversal) |
+| `group-sync` | bridge kind `group.sync` — see `## Moving and regrouping tabs` | ✅ preflight `layout` | reorganizes a WHOLE window's tab/group structure in one call — now gated (KπX directive, GRAVÉ reversal) |
 
 #### Bookmarks (extension-mediated)
 
@@ -293,16 +400,34 @@ root, never `$XDG_RUNTIME_DIR`.
 | Edge CDP port | `33000..41999`, sha256-derived from the profile name (`edge_cdp_port()`, override `BROWSER_PROXY_EDGE_PORT`) | deterministic — daemon/CLI/manual start always agree |
 | Edge executable | `shutil.which("microsoft-edge")` (override `BROWSER_PROXY_EDGE_PATH`) | |
 | Terminal JSON preview threshold | `100` lines (`BROWSER_PROXY_PREVIEW_LINES`, minimum `4`) | `config.PREVIEW_LINES_DEFAULT` |
-| Daemon idle TTL | `1800`s (`BROWSER_PROXY_IDLE_SECONDS`) | **suspended while an extension is connected** — see `## Idle lifecycle` |
-| Daemon hard lifetime cap | `28800`s (`BROWSER_PROXY_MAX_LIFETIME_SECONDS`) | always applies, even while connected |
+| HITL approval timeout | `20.0` seconds (`BROWSER_PROXY_HITL_TIMEOUT_SECONDS`) | `config.HITL_TIMEOUT_SECONDS_DEFAULT` — single source of truth for BOTH the extension's own overlay-expiry alarm AND the daemon-side bridge wait (with a fixed +5s grace margin on the daemon side, see `## HITL design`); root-caused live (KπX): these used to be two independently hardcoded numbers that could silently drift apart |
 
-### Idle lifecycle (fixed)
+### Daemon lifecycle — purely lançable/arrêtable, NO automatic timeout (KπX directive, GRAVÉ)
 
-**Root-caused bug (fixed):** `Daemon._lifecycle()` used to self-stop after `idle_seconds` purely
-from the absence of a `do`/`admin` CLI call — even while an authenticated extension stayed
-connected and useful, force-closing a healthy bridge for no functional reason. The idle timer is
-now suspended entirely while `self.bridge.connected` is true; `max_lifetime_seconds` is the only
-unconditional ceiling left.
+**Root-caused bug (fixed twice):** first, `Daemon._lifecycle()` self-stopped after an idle TTL
+purely from the absence of a `do`/`admin` CLI call, force-closing a healthy authenticated extension
+bridge for no functional reason; that was "fixed" by suspending the idle timer while
+`bridge.connected`. But this only held while the bridge STAYED connected — the instant it dropped
+for any unrelated reason (network blip, an old un-reloaded extension build, computer sleep), the
+idle countdown resumed and killed the WHOLE daemon, CDP included. KπX's directive: remove the
+automatic timeout entirely, not paper over it a second time. Every managed Edge window is already
+always visible — if an agent leaves one open, KπX can see and close it directly; there is no case
+where an unattended timeout is the right way to reclaim a daemon.
+
+**Current design:** `Daemon()` takes no lifecycle configuration at all — no `idle_seconds`, no
+`max_lifetime_seconds`, no environment variable for either (removing them was the fix, not making
+them configurable). `_await_explicit_stop()` is the ONLY stop path: it blocks on `self._stop`
+forever until the `shutdown` RPC sets it (`admin stop`). The systemd unit's own `RuntimeMaxSec=8h`
+was removed too — that was a second, independent automatic-timeout mechanism enforcing the exact
+same thing KπX rejected, just one layer lower. `Restart=on-failure`/`RestartSec=2` are unrelated
+(crash resilience, never fires against a healthy daemon) and stay.
+
+`admin stop` was ALSO fixed as part of this: it used to run only `systemctl --user stop
+browser-proxy.service`, which silently no-ops for a daemon systemd never launched (e.g. `make
+smoke`'s isolated test daemon) — root-caused a real hang once the idle-TTL fallback that used to
+mask this bug was removed. It now sends the real `shutdown` RPC over the daemon's own Unix socket
+FIRST (works identically whether systemd-managed or not), falling back to `systemctl stop` only if
+the socket itself is unreachable.
 
 ---
 
@@ -476,29 +601,108 @@ per-action tables above for the exact list). The flow, matching `Daemon._approve
 `Daemon.dispatch()` exactly:
 
 ```
-1. Agent runs: browser-proxy do tab-create '{"profile":"default","url":"https://example.com"}'
+1. Agent runs: browser-proxy do group-update '{"profile":"default","group_id":7,"title":"Setup"}'
 2. dispatch() sees action.policy.approval == True
 3. preflight_fields checked first (payload must already contain them, e.g. "profile")
-4. _approve("tab-create", payload) → profile = payload["profile"] → bridge.request("approval",
-     {"action": "tab-create", "payload": {...}, "timeout_seconds": 600}, profile)
-     — routed exclusively to THAT profile's connection, so the overlay only ever appears in the
-     correct Edge window, never a different profile's
-5. Extension shows a closed-shadow-root overlay in the paired Edge window:
-   scopes only (never raw payload/secrets) — Approve once / Deny
-6. Extension replies {"decision": "approved"|"rejected", "comment": "...", "payload": <possibly edited>}
-7. "rejected" (or the 600s timeout) → PermissionError("APPROVAL_REJECTED") → fail closed
-8. "approved" → action.handler(edited_payload, self) actually runs the real CDP/extension call
-9. If action.policy.verification is set, the result is read back and checked against the payload
-10. Envelope: {"meta":{"status":"ok","comment":"...","edited":true|false},"data":{...}}
+4. _target_approval_preview(payload) — if a target_id/target_ids is present (e.g. window-close,
+     tab-activate historically, storage-local-set), enrich the payload with a "context" field
+     (per-window first/last-tab lines, see `windows_preview_for_targets`/`format_window_preview`)
+     BEFORE approval — centralized, not a window-close-only special case
+5. _approve("group-update", enriched_payload) → hitl_timeout = config.HITL_TIMEOUT_SECONDS_DEFAULT
+     (20s) or $BROWSER_PROXY_HITL_TIMEOUT_SECONDS override → bridge.request("approval",
+     {"action": "group-update", "payload": {...}, "timeout_seconds": hitl_timeout}, profile,
+     timeout_seconds=hitl_timeout+5s grace) — routed exclusively to THAT profile's connection, so
+     the overlay only ever appears in the correct Edge window, never a different profile's; the
+     daemon-side wait and the extension-side alarm now derive from the SAME configured value, so
+     the daemon can never give up before the extension's own overlay could still legitimately reply
+     (root-caused live, KπX: a genuinely open, still-waiting overlay and an already-given-up daemon
+     used to be two independently hardcoded numbers with no guaranteed relationship)
+6. Extension shows a closed-shadow-root overlay in the paired Edge window: scopes + real non-secret
+   `details` (raw fields, ANY array-of-strings field rendered one line per element) PLUS
+   `describeNativeReferences()`'s resolved illustrations for `group_id`/`window_id`/`tab_ids`/
+   `layout`/bookmark `id` (real title/url/name, never opaque ids alone) — never raw secrets —
+   Approve once / Deny
+7. Extension replies {"decision": "approved"|"rejected"|"timeout", "comment": "...",
+     "payload": <possibly edited>} — or, if delivery itself failed (no valid tab could ever host
+     the overlay), {"ok": false, "data": {"message": "Failed to show approval UI"}} with no
+     "decision" field at all
+8. Daemon maps the reply to ONE of 3 distinct codes — never a single generic "rejected" hiding
+     WHICH of these actually happened: "rejected" → APPROVAL_REJECTED, "timeout" → APPROVAL_TIMEOUT,
+     anything else (including a delivery failure or the daemon's own bridge-level timeout) →
+     APPROVAL_UNAVAILABLE — each carrying the real message, never silently discarded
+9. "approved" → action.handler(edited_payload, self) actually runs the real CDP/extension call
+10. If action.policy.verification is set, the result is read back and checked against the payload
+11. Envelope: {"meta":{"status":"ok","comment":"...","edited":true|false},"data":{...}}
 ```
 
 **Fail-closed always:** no approval reply, a bridge disconnect, or a timeout are all treated as
-rejection — never as an implicit approval.
+rejection — never as an implicit approval. Root-caused live (KπX): a previous version could return
+`APPROVAL_REJECTED` to the CLI BEFORE a human ever saw a genuinely delivered overlay (a technical
+delivery failure indistinguishable from a real "no") — the 3-code split above exists specifically so
+this is never silently misreported again.
 
 **Human-in-the-loop actions (`browser-ask-user`, `browser-solve-captcha`, …) carry no
 `@require_approval` decorator** — they are not "approved before running", they ARE the mechanism
 that puts a human in the loop (the overlay itself is the action's entire purpose), so there is
 nothing separate to gate.
+
+---
+
+## HITL transparency and redirection (KπX directive)
+
+Two real problems, root-caused live and fixed centrally, not per-kind:
+
+**1. "I had to notice a tab had appeared myself — I should have been redirected to it."** Every
+HITL-hosting tab is now actively focused before the overlay is shown:
+`background.ts`'s `focusHostTab(tabId)` calls `chrome.tabs.update(tabId, {active:true})` **and**
+`chrome.windows.update(windowId, {focused:true})` — bringing both the tab AND its window to the
+front. `createTemporaryHostTab()` (the last-resort tab, see below) is created with `active:true`
+directly, for the same reason. Never a prompt KπX has to go discover by accident.
+
+**2. "I need to see EXACTLY what you're proposing, e.g. the actual grouping."** The overlay used to
+show only a bare action name (`describeApprovalScopes()` → `["group-create"]`). New
+`describeApprovalDetails(request)` extracts the REAL fields of the gated action's own payload
+(`tab_ids`, `title`, `color`, `url`, …) as human-readable lines, shown in the overlay via a new
+`ShowApprovalMessage.details: string[]` field — 100% transparency of WHAT is being proposed. Only
+genuinely secret-shaped fields (`value` on `cookie-set`, `content_base64` on `browser-drop-file`,
+any `password`) are shown as `<redacted>` instead of leaked — never silently omitted, so the
+overlay still names every field that exists.
+
+**Centralized tab resolution, for every non-approval HITL kind too:** `sendToHostTab()`
+(`background.ts`) is the ONE shared entry point `handleUserAsk`/`handleOverlayDismiss`/
+`handleCaptchaSolve`/`handleFormSetDate`/`handleFormSetCombobox`/`handleFormDropFile` all go
+through — the exact same tab-resolution, focus-redirect, and stale-content-script retry behavior
+`requestApproval` already had, never six separately hand-duplicated copies. Root-caused live: a
+found candidate tab's content script can be stale/orphaned right after THIS extension itself
+reloads (`chrome.tabs.sendMessage` silently fails even though the tab looked perfectly usable);
+`sendToHostTab`/`requestApproval` both ALWAYS retry once via a brand-new, focused temporary tab
+(`createTemporaryHostTab()`, `https://example.com/`) whenever the first delivery attempt fails for
+ANY reason — never only when no candidate tab existed at all.
+
+**Temporary-tab leak, fixed:** the temporary host tab is always closed once the interaction settles
+— on an explicit decision (`handleApprovalResponse`) or on expiry with no answer at all. The expiry
+sweep is armed via `chrome.alarms` (`armApprovalExpiryAlarm`, one-shot, uniquely named per request),
+never a plain `setTimeout` — root-caused live: a `setTimeout` is silently discarded if the service
+worker is evicted before it fires (confirmed: a temporary `https://example.com` tab was left open
+for many minutes across several subsequent turns after one approval was abandoned mid-flow, well
+under the setTimeout's own 60s deadline — because the worker died first). `chrome.alarms` always
+survives eviction — Chromium redelivers it by waking the worker, the same pattern already used for
+the reconnect watchdog (see `## Extension bridge identity`).
+
+**`do group-sync` — reorganize a WHOLE window in ONE call, absolute flexibility (KπX directive):**
+bridge kind `group.sync`, payload `{"layout": [...]}}` — an ORDERED list processed left to right,
+each entry either `{"type":"tab","tab_id":N}` (a standalone ungrouped tab at this position) or
+`{"type":"group","group_id":N|omitted,"title":str,"color":str,"tab_ids":[N,...]}` (a whole group at
+this position — `group_id` given reuses/renames/recolors/adds-to that EXACT existing group;
+omitted creates a brand-new one). One command creates, renames, recolors, adds-to, removes-from,
+AND repositions, all at once — never N separately-approved primitive calls for what is
+conceptually one deliberate rearrangement. **Now `@require_approval`** (KπX directive, GRAVÉ — a
+reversal from its original "directly observable" stance, same as `group-remove-tabs`): its HITL
+overlay resolves every real tab id referenced ANYWHERE inside `layout` via `describeNativeReferences`
+(nested-entry-aware, shared with `window-sync`'s own `layout` field — one illustration path, never
+duplicated per action). `tab-update`/`group-add-tabs` remain the two exceptions that stay
+approval-free — repositioning/regrouping an already-visible tab without changing a whole
+window/group's STRUCTURE is still directly observable, the line KπX drew between the two.
 
 ---
 

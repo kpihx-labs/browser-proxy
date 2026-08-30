@@ -10,23 +10,26 @@ from browser_proxy.models import RpcRequest
 
 
 def test_registry_covers_all_required_edge_domains() -> None:
-    """The registry documents profiles, windows, tabs, workspaces, bookmarks, and raw CDP."""
+    """The registry documents profiles, windows, tabs, bookmarks, and raw CDP."""
     validate_registry()
     assert {
         "profile-list",
         "window-create",
         "tab-list",
-        "page-list",
-        "workspace-list",
+        "tab-get",
         "bookmark-list",
         "raw",
     } <= set(REGISTRY)
+    assert not any(name.startswith("workspace-") for name in REGISTRY)
     assert not REGISTRY["raw"].policy.approval
     # Deliberately NOT approval-gated (KπX directive): every managed Edge window is already
     # always real and visible — opening one is directly observable, no hidden side effect to gate.
+    # `layout` is the ONE required way to describe window content — never a separate top-level
+    # `url` for "the first tab" alongside a batch field for the rest (root-caused duplication,
+    # fixed): so no `verification` field exists for it any more either.
     assert REGISTRY["window-create"].policy.approval is False
-    assert REGISTRY["window-create"].policy.preflight_fields == ("profile",)
-    assert REGISTRY["window-create"].policy.verification == ("url",)
+    assert REGISTRY["window-create"].policy.preflight_fields == ("profile", "layout")
+    assert REGISTRY["window-create"].policy.verification == ()
     # Same rationale, same KπX directive: opening a tab in an always-visible window is
     # directly observable too.
     assert REGISTRY["tab-create"].policy.approval is False
@@ -80,7 +83,7 @@ def test_socket_roundtrip_uses_real_client_transport(tmp_path: Path, monkeypatch
     monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
 
     async def run() -> None:
-        daemon = Daemon(idle_seconds=30, max_lifetime_seconds=30)
+        daemon = Daemon()
         task = asyncio.create_task(daemon.serve())
         for _ in range(50):
             if (tmp_path / "state/browser-proxy.sock").exists():

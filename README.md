@@ -26,6 +26,14 @@ browser-proxy do window-create '{"profile":"default","url":"https://a.example","
 ]}'
 browser-proxy do raw '{"method":"Target.getTargets","params":{}}'
 browser-proxy do group-list '{"profile":"default"}'
+browser-proxy do tab-move '{"profile":"default","tab_id":12,"after_tab_id":34}'
+browser-proxy do group-add-tabs '{"profile":"default","group_id":7,"tab_ids":[12,13]}'
+browser-proxy do group-remove-tabs '{"profile":"default","tab_ids":[12]}'
+browser-proxy do group-sync '{"profile":"default","layout":[
+  {"type":"tab","tab_id":1},
+  {"type":"group","title":"Research","tab_ids":[2,3]},
+  {"type":"tab","tab_id":4}
+]}'
 browser-proxy do page-navigate '{"profile":"default","target_id":"T1","url":"https://example.com"}'
 browser-proxy do page-click '{"profile":"default","target_id":"T1","selector":"#submit"}'
 browser-proxy do page-evaluate '{"profile":"default","target_id":"T1","expression":"document.title"}'
@@ -74,10 +82,31 @@ connection — a request for a profile with no matching connection fails closed 
 (`EXTENSION_UNAVAILABLE: <profile>`), never silently answered by a different profile. See
 `CONTRACT.md` → Extension bridge identity.
 
+**Every HITL prompt is 100% transparent and redirects to itself (KπX directive).** The overlay
+shows the REAL non-secret proposal details (real `tab_ids`, `title`, `color`, `url`, …), never just
+a bare action name — only genuinely secret-shaped fields (a cookie's real value, a dropped file's
+raw bytes, any password) are shown as `<redacted>` instead. The extension always brings the hosting
+tab AND its window to the front first — never a prompt you have to discover by accident. The same
+centralized tab resolution backs every HITL kind (approval, ask, dismiss-overlays, captcha, set
+date/combobox, drop-file), including automatic retry via a fresh temporary tab if the found one's
+content script turns out stale (e.g. right after the extension itself reloads) — that temporary tab
+is always closed again once the interaction settles, never left behind. `do group-sync` reorganizes
+a whole window's tab/group layout — create, rename, recolor, add-to, remove-from, reposition — in
+ONE call. See `CONTRACT.md` → HITL transparency and redirection.
+
 The registry covers the full Edge profile hierarchy: profiles, heuristic Workspaces, windows,
 tab groups, tabs, pages, and profile bookmarks. `workspace-list` and `group-list` clearly label
 heuristic/non-authoritative data where Edge lacks a public Workspace API. The implementation is
 strictly Edge-only; it does not launch, target, or publish for Chrome.
+
+**Tab/group structure is one canonical computation, not three independent views.** CDP has no
+concept of tab groups or real tab order at all — only `chrome.tabs.query`/`chrome.tabGroups.query`
+(extension-side) can answer "what group is this tab in" or "what is the real left-to-right order."
+`computeWindowLayouts()` computes that ONE truth once; `window-list`'s `chrome_layout` field,
+`group-list`, and the movement actions (`tab-move`, `group-add-tabs`, `group-remove-tabs`) all read
+or mutate the exact same state. See `CONTRACT.md` → Canonical tab/group structure for the full
+`tabs`/`groups`/`order` shape, the CDP-`target_id`-vs-`chrome_tab_id` bridging strategy, and why the
+3 new movement actions are deliberately approval-free like `window-create`/`tab-create`.
 
 `raw` sends a browser-level CDP method and its parameters inside that same object. Conservative
 read-only methods (`Browser.getVersion`, `Target.getTargets`, and related inspection calls) run
@@ -87,10 +116,12 @@ extension approval; a payload flag can never bypass it.
 ## Lifecycle
 
 The daemon (`browser-proxy.service`, started via `admin start`, or on demand by the client's own
-fallback) owns an exclusive lock, uses a Unix-domain socket, tracks work activity, stops after an
-idle TTL, and has a hard lifetime cap. **The idle TTL is suspended entirely while an authenticated
-extension stays connected** — a paired, idle-but-connected extension is never force-disconnected
-just because no CLI command ran recently; `max_lifetime_seconds` remains the only unconditional cap.
+fallback) owns an exclusive lock and uses a Unix-domain socket. **It has deliberately NO automatic
+timeout — no idle TTL, no maximum lifetime (KπX directive).** It is purely lançable/arrêtable on
+request: `admin start`/`admin stop` (which now sends the real `shutdown` RPC over the socket first,
+falling back to `systemctl stop` only if the socket is unreachable), or the OS itself. Every
+managed Edge window is already always visible, so KπX can directly see and close one an agent
+forgot — there is no case where an unattended timeout is the right way to reclaim a daemon.
 
 Every Microsoft Edge instance is its **own separate systemd-templated service**, decoupled from the
 daemon's lifetime — never a raw `subprocess.Popen`, never a hand-typed `microsoft-edge` command.

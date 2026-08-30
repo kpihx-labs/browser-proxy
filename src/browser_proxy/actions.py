@@ -5,12 +5,18 @@ import base64
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from browser_proxy.cdp import CdpBrowser
 from browser_proxy.doc import attach_public_docstrings
-from browser_proxy.paths import edge_cdp_port, edge_profile_dir, edge_profile_state
+from browser_proxy.paths import (
+    edge_cdp_port,
+    edge_profile_dir,
+    edge_profile_state,
+    saved_windows_path,
+)
 from browser_proxy.policy import (
     Policy,
     policy_of,
@@ -218,15 +224,18 @@ async def _profile_remove(payload: dict[str, Any], context: DaemonContext) -> di
 
 
 async def _page_targets(browser: CdpBrowser) -> list[dict[str, Any]]:
-    """Purpose: list real page-type CDP targets — the one shared fact behind 4 actions.
+    """Purpose: list real page-type CDP targets — the one shared fact behind every action needing it.
 
     Args:
         browser (CdpBrowser): Client bound to one managed Edge debugging port.
 
     Returns:
         list[dict[str, Any]]: Every ``Target.getTargets`` entry with ``type == "page"``. Used
-        identically by ``window-list``, ``tab-list``, ``page-list``, and ``workspace-list`` —
-        never a private re-implementation of this exact filter in each handler.
+        by ``window-list`` (``tab-list``/``tab-get`` reuse ``window-list``'s full computation instead
+        — see ``_tabs_with_context`` — for window/group context; ``page-list``/``page-get`` were
+        purged and merged into ``tab-list``/``tab-get``, KπX directive: "tab = page... je ne veux pas
+        de duplication inutile") — never a private re-implementation of this exact filter in each
+        handler.
 
     Examples:
         >>> asyncio.iscoroutinefunction(_page_targets)
@@ -268,20 +277,160 @@ async def _window_id_for_target(
     return (window_id if isinstance(window_id, int) else None), dict(info.get("bounds", {}))
 
 
+def _correlate_cdp_targets(
+    cdp_tabs: list[dict[str, Any]], chrome_tabs: list[dict[str, Any]]
+) -> None:
+    """Purpose: attach a best-effort CDP ``target_id`` onto each extension-sourced chrome tab entry.
+
+    Args:
+        cdp_tabs (list[dict[str, Any]]): One real window's CDP page targets, in ``Target.getTargets``
+            encounter order.
+        chrome_tabs (list[dict[str, Any]]): The SAME window's canonical chrome-tab entries (from
+            ``window.layout``), in real ``index`` order. Mutated in place: adds ``"target_id"``.
+
+    Returns:
+        None: CDP and the extension are two independent identifier systems (CDP ``target_id``
+        strings vs. real numeric ``chrome.tabs.Tab.id``) with no first-class mapping between them —
+        this pairs them by matching URL in left-to-right encounter order on both sides, which is
+        exact for the common case (each URL open once) and deterministic even for duplicate URLs
+        (Nth occurrence pairs with Nth occurrence on both sides) rather than silently picking
+        whichever matches first. Sets ``"target_id": None`` when nothing matches at all.
+
+    Examples:
+        >>> _correlate_cdp_targets.__name__
+        '_correlate_cdp_targets'
+        >>> callable(_correlate_cdp_targets)
+        True
+    """
+    remaining_by_url: dict[str | None, list[str]] = {}
+    for target in cdp_tabs:
+        remaining_by_url.setdefault(target.get("url"), []).append(target["targetId"])
+    for tab in chrome_tabs:
+        candidates = remaining_by_url.get(tab.get("url"))
+        tab["target_id"] = candidates.pop(0) if candidates else None
+
+
+async def windows_preview_for_targets(
+    browser: CdpBrowser, target_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Purpose: summarize each REAL window touched by a batch of target_ids for human approval.
+
+    Args:
+        browser (CdpBrowser): Client bound to one managed Edge debugging port.
+        target_ids (list[str]): CDP target ids about to be acted on (e.g. closed).
+
+    Returns:
+        list[dict[str, Any]]: One entry per distinct window touched by ``target_ids``, each with
+        ``window_id``, ``target_count`` (how many of the given ``target_ids`` live in that window),
+        ``tab_count`` (total real tabs currently in that window), and ``first``/``last``
+        (``{"title", "url"}`` of the window's first/last tab in real ``Target.getTargets``
+        encounter order) — root-caused live (KπX): a ``window-close`` approval showing only opaque
+        CDP ``target_ids`` gave no way to recognize WHICH window corresponds to which id; this is
+        the exact first/last-tab context needed to tell windows apart at a glance. Public (no
+        leading underscore) because ``daemon.dispatch()`` calls it cross-module before approval,
+        unlike the rest of this module's private per-window helpers.
+
+    Examples:
+        >>> asyncio.iscoroutinefunction(windows_preview_for_targets)
+        True
+        >>> callable(windows_preview_for_targets)
+        True
+    """
+    all_tabs = await _page_targets(browser)
+    window_for_target: dict[str, int | None] = {}
+    for tab in all_tabs:
+        window_id, _ = await _window_id_for_target(browser, tab["targetId"])
+        window_for_target[tab["targetId"]] = window_id
+    tabs_by_window: dict[int | None, list[dict[str, Any]]] = {}
+    for tab in all_tabs:
+        tabs_by_window.setdefault(window_for_target[tab["targetId"]], []).append(tab)
+    touched_windows: dict[int | None, int] = {}
+    for target_id in target_ids:
+        window_id = window_for_target.get(target_id)
+        touched_windows[window_id] = touched_windows.get(window_id, 0) + 1
+
+    def _summary(tab: dict[str, Any]) -> dict[str, str]:
+        """Purpose: reduce one raw CDP page target to its human-readable title/url pair.
+
+        Args:
+            tab (dict[str, Any]): One ``Target.getTargets`` page entry.
+
+        Returns:
+            dict[str, str]: ``{"title": ..., "url": ...}``, always both keys present (empty string
+            fallback), never a raw target blob leaking unrelated CDP fields into the approval UI.
+
+        Examples:
+            >>> _summary({"title": "Pi", "url": "https://en.wikipedia.org/wiki/Pi"})
+            {'title': 'Pi', 'url': 'https://en.wikipedia.org/wiki/Pi'}
+            >>> _summary({})
+            {'title': '', 'url': ''}
+        """
+        return {"title": str(tab.get("title", "")), "url": str(tab.get("url", ""))}
+
+    previews: list[dict[str, Any]] = []
+    for window_id, target_count in touched_windows.items():
+        tabs = tabs_by_window.get(window_id, [])
+        previews.append(
+            {
+                "window_id": window_id,
+                "target_count": target_count,
+                "tab_count": len(tabs),
+                "first": _summary(tabs[0]) if tabs else None,
+                "last": _summary(tabs[-1]) if tabs else None,
+            }
+        )
+    return previews
+
+
+def format_window_preview(preview: dict[str, Any]) -> str:
+    """Purpose: render one ``windows_preview_for_targets`` entry as a single human-readable line.
+
+    Args:
+        preview (dict[str, Any]): One entry produced by ``windows_preview_for_targets``.
+
+    Returns:
+        str: ``"window <id>: <closing>/<total> tabs to close — first: \"<title>\", last:
+        \"<title>\""`` — the exact first/last recognition context KπX asked for in the HITL
+        overlay, never just a bare window id or opaque target_ids.
+
+    Examples:
+        >>> format_window_preview({"window_id": 1, "target_count": 2, "tab_count": 2, \
+"first": {"title": "A", "url": "https://a"}, "last": {"title": "B", "url": "https://b"}})
+        'window 1: 2/2 tabs to close — first: "A", last: "B"'
+        >>> format_window_preview({"window_id": 2, "target_count": 1, "tab_count": 1, \
+"first": None, "last": None})
+        'window 2: 1/1 tabs to close — first: (empty), last: (empty)'
+    """
+    first = preview.get("first")
+    last = preview.get("last")
+    first_desc = f'"{first["title"]}"' if first else "(empty)"
+    last_desc = f'"{last["title"]}"' if last else "(empty)"
+    return (
+        f"window {preview['window_id']}: {preview['target_count']}/{preview['tab_count']} "
+        f"tabs to close — first: {first_desc}, last: {last_desc}"
+    )
+
+
 async def _window_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: list Edge windows, each with its own real bounds and the tabs living inside it.
+    """Purpose: list Edge windows with real bounds, tabs, AND the canonical tab/group structure.
 
     Args:
         payload (dict[str, Any]): Object containing a started ``profile`` name.
-        context (DaemonContext): Daemon state used to resolve that profile.
+        context (DaemonContext): Daemon state used to resolve that profile and, when connected,
+            the paired extension.
 
     Returns:
         dict[str, Any]: Profile name and one entry per REAL Edge window (``window_id``, ``bounds``,
-        ``tabs``) — never a flat target list. Grouping is resolved via one genuine
-        ``Browser.getWindowForTarget`` call per tab (see ``_window_id_for_target``), not guessed:
-        ``Target.getTargets`` alone carries no window-grouping field, so a flat list (the previous
-        implementation, byte-identical to ``tab-list``) could never answer "which tab is in which
-        window" once more than one real window is open.
+        ``tabs`` — the pre-existing raw CDP target list, unchanged shape) plus ``chrome_layout``:
+        ``{"tabs", "groups", "order"}`` from the SAME canonical computation ``group-list``/
+        ``tab-update``/``group-add-tabs`` use (see ``profile_state``-style single-source discipline),
+        with each chrome tab correlated to its CDP ``target_id`` (see ``_correlate_cdp_targets``).
+        ``chrome_layout`` is ``None`` when the extension is not connected for this profile — CDP
+        alone has no concept of tab groups or real tab order (``Target.getTargets`` carries neither
+        an ``index`` nor a ``groupId``), so this is an honest degradation, never a silent guess.
+        Grouping is resolved via one genuine ``Browser.getWindowForTarget`` call per tab (see
+        ``_window_id_for_target``), not guessed: a flat list (the previous implementation, byte-
+        identical to ``tab-list``) could never answer "which tab is in which window."
 
     Examples:
         >>> _window_list.__name__
@@ -298,7 +447,36 @@ async def _window_list(payload: dict[str, Any], context: DaemonContext) -> dict[
             grouped[window_id] = {"window_id": window_id, "bounds": bounds, "tabs": []}
             order.append(window_id)
         grouped[window_id]["tabs"].append(target)
-    return {"profile": name, "windows": [grouped[window_id] for window_id in order]}
+
+    chrome_windows: dict[int, dict[str, Any]] = {}
+    try:
+        layout_reply = await context.extension_request("window.layout", {"profile": name}, name)
+        windows_field = layout_reply.get("windows")
+        if isinstance(windows_field, dict):
+            for key, layout in windows_field.items():
+                try:
+                    chrome_windows[int(key)] = layout
+                except (TypeError, ValueError):
+                    continue
+    except RuntimeError:
+        chrome_windows = {}
+
+    windows: list[dict[str, Any]] = []
+    for window_id in order:
+        entry = grouped[window_id]
+        chrome_layout = chrome_windows.get(window_id) if window_id is not None else None
+        if chrome_layout is None:
+            entry["chrome_layout"] = None
+        else:
+            chrome_tabs = list(chrome_layout.get("tabs", []))
+            _correlate_cdp_targets(entry["tabs"], chrome_tabs)
+            entry["chrome_layout"] = {
+                "tabs": chrome_tabs,
+                "groups": chrome_layout.get("groups", {}),
+                "order": chrome_layout.get("order", []),
+            }
+        windows.append(entry)
+    return {"profile": name, "windows": windows}
 
 
 async def _create_window_tab(
@@ -308,18 +486,27 @@ async def _create_window_tab(
     window_id: int | None,
     url: str,
     capture_chrome_id: bool,
+    *,
+    new_window: bool = False,
 ) -> tuple[str, int | None]:
-    """Purpose: create one tab inside an existing window, optionally capturing its REAL chrome tab id.
+    """Purpose: create ONE tab — inside an existing window, in a genuinely new one, or the current
+    one — optionally capturing its REAL chrome tab id. The single, centralized tab-creation
+    primitive shared by ``window-create``'s layout builder AND ``tab-create`` (KπX directive:
+    "centralise vraiment tout cela" — never two independently-written ways to create a tab).
 
     Args:
         browser (CdpBrowser): Client bound to one managed Edge debugging port.
         context (DaemonContext): Daemon state exposing the paired extension.
         profile (str): Target browser-proxy profile (routes the capture request correctly).
         window_id (int | None): Real Edge window to open the tab in, from ``Browser.getWindowForTarget``.
+            Mutually exclusive with ``new_window`` — the caller validates this, never both truthy.
         url (str): Absolute page URL for the new tab.
-        capture_chrome_id (bool): Whether a real ``chrome.tabs.Tab.id`` must be resolved — only
-            needed when this tab will be grouped afterwards (``chrome.tabs.group`` requires the
-            extension's own numeric id, never the CDP ``targetId`` string).
+        capture_chrome_id (bool): Whether a real ``chrome.tabs.Tab.id`` must be resolved — needed
+            whenever this tab will be grouped or repositioned afterwards (``chrome.tabs.group``/
+            ``chrome.tabs.move`` require the extension's own numeric id, never the CDP ``targetId``
+            string).
+        new_window (bool): Force a genuinely new Edge window instead of the current one; ignored
+            (never sent) when ``window_id`` is given.
 
     Returns:
         tuple[str, int | None]: CDP ``target_id`` and, when requested, the real chrome tab id
@@ -334,6 +521,8 @@ async def _create_window_tab(
     options: dict[str, Any] = {"url": url}
     if window_id is not None:
         options["windowId"] = window_id
+    elif new_window:
+        options["newWindow"] = True
     if not capture_chrome_id:
         result = await browser.call("Target.createTarget", options)
         return result["targetId"], None
@@ -348,42 +537,41 @@ async def _create_window_tab(
     return result["targetId"], (chrome_tab_id if isinstance(chrome_tab_id, int) else None)
 
 
-async def _apply_window_items(
-    items: Any, browser: CdpBrowser, context: DaemonContext, profile: str, window_id: int | None
-) -> list[dict[str, Any]] | None:
+async def _apply_window_layout(
+    layout: Any, browser: CdpBrowser, context: DaemonContext, profile: str, window_id: int | None
+) -> list[dict[str, Any]]:
     """Purpose: create a whole ordered tab/group layout inside one window from a flat JSON list.
 
     Args:
-        items (Any): Untrusted ``window-create``/``items`` payload value; ``None`` means no layout.
+        layout (Any): Untrusted ``window-create``/``layout`` payload value — REQUIRED, non-empty
+            (a window with zero tabs cannot exist). The SAME shape and field name as
+            ``group-sync``'s ``layout`` — one uniform vocabulary for "describe a window's tab/group
+            content", never a second, differently-shaped way to say the same thing.
         browser (CdpBrowser): Client bound to one managed Edge debugging port.
         context (DaemonContext): Daemon state exposing the paired extension (needed for groups).
         profile (str): Target browser-proxy profile.
         window_id (int | None): Real Edge window every created tab/group must land in.
 
     Returns:
-        list[dict[str, Any]] | None: One entry per item in the exact order given (``None`` when
-        ``items`` was omitted entirely — the pre-existing single-``url`` behavior is unaffected).
-        Each entry is ``{"type": "tab", "url", "target_id"}`` or ``{"type": "group", "title",
-        "tabs": [...], "group": <extension-confirmed result>}``. Reusable by any future action that
-        needs to populate an existing window (not only a freshly created one).
+        list[dict[str, Any]]: One entry per item in the exact order given. Each entry is
+        ``{"type": "tab", "url", "target_id"}`` or ``{"type": "group", "title", "tabs": [...],
+        "group": <extension-confirmed result>}``.
 
     Raises:
-        ValueError: If ``items``, or any entry inside it, is not shaped as documented.
+        ValueError: If ``layout``, or any entry inside it, is not shaped as documented, or empty.
 
     Examples:
-        >>> asyncio.iscoroutinefunction(_apply_window_items)
+        >>> asyncio.iscoroutinefunction(_apply_window_layout)
         True
-        >>> callable(_apply_window_items)
+        >>> callable(_apply_window_layout)
         True
     """
-    if items is None:
-        return None
-    if not isinstance(items, list):
-        raise ValueError("items must be a list of {type: 'tab'|'group', ...} objects")
+    if not isinstance(layout, list) or not layout:
+        raise ValueError("layout must be a non-empty list of {type: 'tab'|'group', ...} objects")
     created: list[dict[str, Any]] = []
-    for index, item in enumerate(items):
+    for index, item in enumerate(layout):
         if not isinstance(item, dict) or "type" not in item:
-            raise ValueError(f"items[{index}] must be an object with a 'type' field")
+            raise ValueError(f"layout[{index}] must be an object with a 'type' field")
         kind = item["type"]
         if kind == "tab":
             url = str(item.get("url", "about:blank"))
@@ -394,7 +582,9 @@ async def _apply_window_items(
         elif kind == "group":
             tabs_spec = item.get("tabs")
             if not isinstance(tabs_spec, list) or not tabs_spec:
-                raise ValueError(f"items[{index}] of type 'group' requires a non-empty 'tabs' list")
+                raise ValueError(
+                    f"layout[{index}] of type 'group' requires a non-empty 'tabs' list"
+                )
             chrome_tab_ids: list[int] = []
             tab_entries: list[dict[str, Any]] = []
             for tab_index, tab_item in enumerate(tabs_spec):
@@ -404,7 +594,7 @@ async def _apply_window_items(
                     tab_url = tab_item
                 else:
                     raise ValueError(
-                        f"items[{index}].tabs[{tab_index}] must be a URL or {{'url': ...}}"
+                        f"layout[{index}].tabs[{tab_index}] must be a URL or {{'url': ...}}"
                     )
                 target_id, chrome_tab_id = await _create_window_tab(
                     browser, context, profile, window_id, tab_url, capture_chrome_id=True
@@ -412,7 +602,7 @@ async def _apply_window_items(
                 if chrome_tab_id is None:
                     raise RuntimeError(
                         f"EXTENSION_UNAVAILABLE: {profile} (could not capture a real tab id for "
-                        f"items[{index}].tabs[{tab_index}] — grouping requires the paired extension)"
+                        f"layout[{index}].tabs[{tab_index}] — grouping requires the paired extension)"
                     )
                 chrome_tab_ids.append(chrome_tab_id)
                 tab_entries.append(
@@ -433,40 +623,43 @@ async def _apply_window_items(
                 }
             )
         else:
-            raise ValueError(f"items[{index}].type must be 'tab' or 'group', got {kind!r}")
+            raise ValueError(f"layout[{index}].type must be 'tab' or 'group', got {kind!r}")
     return created
 
 
-@require_preflight("profile")
-@require_verification("url")
+@require_preflight("profile", "layout")
 async def _window_create(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: create a visible Edge window in a started persistent profile, optionally laying out
-    a whole ordered tab/group structure inside it in one call.
+    """Purpose: create a visible Edge window and lay out its whole ordered tab/group content.
 
     Args:
-        payload (dict[str, Any]): Profile, URL, optional CDP window bounds/state, and an optional
-            ``items`` list — e.g. ``[{"type":"tab","url":"..."}, {"type":"group","title":"...",
-            "tabs":["...","..."]}]`` — created in that exact order after the window opens, so a
-            whole tab/group setup (one tab, then a group of 3 tabs, then another tab, ...) is a
-            single deliberate command instead of many separate approval-free but still sequential
-            ``tab-create``/``group-create`` calls.
+        payload (dict[str, Any]): Profile, optional CDP window bounds/state, and the REQUIRED,
+            non-empty ``layout`` — e.g. ``[{"type":"tab","url":"..."}, {"type":"group","title":
+            "...","tabs":["...","..."]}]`` — created in that exact order. One single, uniform way
+            to describe a window's content, the SAME field name and entry shape as ``group-sync``
+            — never a separate top-level ``url`` for "the first tab" alongside a batch field for
+            "the rest" (root-caused, KπX directive: that split was itself the exact unclean,
+            patched-on-afterward duplication this whole tab/group refonte set out to remove).
         context (DaemonContext): Daemon state used to resolve the Edge profile and, only when
-            ``items`` contains a group, the paired extension.
+            ``layout`` contains a group, the paired extension.
 
     Returns:
-        dict[str, Any]: Profile, requested URL, newly created target identifier, the window's real
-        ``window_id`` (from ``Browser.getWindowForTarget`` — see ``## Window grouping``), and, only
-        when ``items`` was supplied, the ordered ``items`` creation result.
+        dict[str, Any]: Profile, the window's real ``window_id`` (from
+        ``Browser.getWindowForTarget`` — see ``## Window grouping``), and the ordered ``layout``
+        creation result.
 
     Notes:
         Deliberately NOT ``@require_approval`` (KπX directive): every managed Edge window is
         already always real and visible (never headless — see ``## Edge lifecycle``), so opening
         one is directly observable the instant it happens; it carries no hidden side effect an
         approval overlay would meaningfully gate. Because the parent action is itself
-        approval-free, the tabs/groups created via ``items`` bypass ``tab-create``'s/
+        approval-free, the tabs/groups created via ``layout`` bypass ``tab-create``'s/
         ``group-create``'s own individual approval gates too — this whole layout is one single
-        deliberate command, not a series of separately-approved ones. Still preflight-``profile``
-        and verify-``url``.
+        deliberate command, not a series of separately-approved ones. Mechanically: the window is
+        first created with a disposable ``about:blank`` placeholder tab (needed because
+        ``Target.createTarget`` always requires an initial URL) so its real ``window_id`` can be
+        resolved BEFORE any real tab/group exists; every ``layout`` entry then lands in that SAME
+        window; the placeholder is closed last, once at least one real tab already exists — never
+        left behind as a stray extra tab.
 
     Examples:
         >>> _window_create.__name__
@@ -475,39 +668,34 @@ async def _window_create(payload: dict[str, Any], context: DaemonContext) -> dic
         True
     """
     name, browser = _profile(payload, context)
-    url = str(payload.get("url", "about:blank"))
-    options: dict[str, Any] = {"url": url, "newWindow": True}
+    options: dict[str, Any] = {"url": "about:blank", "newWindow": True}
     for key in ("left", "top", "width", "height", "windowState", "focus"):
         if key in payload:
             options[key] = payload[key]
     result = await browser.call("Target.createTarget", options)
-    target_id = result["targetId"]
-    window_id, _bounds = await _window_id_for_target(browser, target_id)
-    response: dict[str, Any] = {
-        "profile": name,
-        "url": url,
-        "target_id": target_id,
-        "window_id": window_id,
-    }
-    items_result = await _apply_window_items(
-        payload.get("items"), browser, context, name, window_id
+    placeholder_target_id = result["targetId"]
+    window_id, _bounds = await _window_id_for_target(browser, placeholder_target_id)
+    layout_result = await _apply_window_layout(
+        payload.get("layout"), browser, context, name, window_id
     )
-    if items_result is not None:
-        response["items"] = items_result
-    return response
+    await browser.call("Target.closeTarget", {"targetId": placeholder_target_id})
+    return {"profile": name, "window_id": window_id, "layout": layout_result}
 
 
 @require_approval
-@require_preflight("profile", "target_id")
+@require_preflight("profile", "target_ids")
 async def _window_close(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: close an Edge target window by its CDP target identifier.
+    """Purpose: close one or many Edge targets (tabs/windows) by CDP target identifier, in ONE call.
 
     Args:
-        payload (dict[str, Any]): Profile and required ``target_id`` to close.
+        payload (dict[str, Any]): Profile and required, non-empty ``target_ids`` list — closing
+            several tabs/windows across the profile is ONE deliberate command with ONE approval,
+            never N separate ``do window-close`` calls each needing its own approval round-trip
+            (root-caused, KπX directive: too slow/tedious in practice, confirmed live).
         context (DaemonContext): Daemon state used to resolve the Edge profile.
 
     Returns:
-        dict[str, Any]: Profile, target ID, and confirmed close intent.
+        dict[str, Any]: Profile, the exact ``target_ids`` closed, and a confirmed close intent.
 
     Examples:
         >>> _window_close.__name__
@@ -516,22 +704,435 @@ async def _window_close(payload: dict[str, Any], context: DaemonContext) -> dict
         True
     """
     name, browser = _profile(payload, context)
-    target_id = str(payload.get("target_id", ""))
-    if not target_id:
-        raise ValueError("target_id is required")
-    await browser.call("Target.closeTarget", {"targetId": target_id})
-    return {"profile": name, "target_id": target_id, "closed": True}
+    target_ids = payload.get("target_ids")
+    if not isinstance(target_ids, list) or not target_ids:
+        raise ValueError("target_ids must be a non-empty list of CDP target ids")
+    closed: list[str] = []
+    for target_id in target_ids:
+        await browser.call("Target.closeTarget", {"targetId": str(target_id)})
+        closed.append(str(target_id))
+    return {"profile": name, "target_ids": closed, "closed": True}
+
+
+@require_approval
+@require_preflight("profile", "window_id")
+async def _window_sync(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: reorganize an EXISTING window's own properties AND its whole tab/group content in
+    ONE call — the window-level equivalent of ``group-sync``, "très complet et flexible" (KπX).
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``window_id`` (the REAL Edge window to target),
+            optional ``bounds`` (``{"left","top","width","height"}``, any subset), optional
+            ``state`` (``"normal"|"maximized"|"minimized"|"fullscreen"``), optional ``focused``
+            (bool), optional ``layout`` (the SAME ordered tab/group schema ``window-create``/
+            ``group-sync`` use — reused unchanged, never a second, differently-shaped vocabulary
+            for "describe a window's content").
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: ``window_id``, the extension-confirmed window properties after any
+        requested ``bounds``/``state``/``focused`` change, and ``layout`` (present only if a
+        ``layout`` was given) with the SAME shape ``group-sync`` returns.
+
+    Raises:
+        ValueError: No field beyond ``profile``/``window_id`` given at all (a no-op call).
+
+    Notes:
+        HITL-gated (KπX directive, GRAVÉ): reorganizing a whole window's structure — its own
+        bounds/state and/or its entire tab/group content — is treated as one deliberate, reviewable
+        command, same as its sibling ``group-sync``.
+
+    Examples:
+        >>> _window_sync.__name__
+        '_window_sync'
+        >>> callable(_window_sync)
+        True
+    """
+    window_id = int(payload["window_id"])
+    profile = str(payload.get("profile", "default"))
+    wants_window_update = any(key in payload for key in ("bounds", "state", "focused"))
+    layout = payload.get("layout")
+    if not wants_window_update and not layout:
+        raise ValueError("window-sync requires at least one of: bounds, state, focused, layout")
+    result: dict[str, Any] = {"window_id": window_id}
+    if wants_window_update:
+        update_payload: dict[str, Any] = {"profile": profile, "window_id": window_id}
+        for field in ("bounds", "state", "focused"):
+            if field in payload:
+                update_payload[field] = payload[field]
+        window_result = await context.extension_request("window.update", update_payload, profile)
+        result.update(window_result)
+    if layout is not None:
+        layout_result = await context.extension_request(
+            "group.sync", {"profile": profile, "layout": layout}, profile
+        )
+        result["layout"] = layout_result.get("layout", [])
+    return result
+
+
+def _load_saved_windows(profile: str) -> dict[str, Any]:
+    """Purpose: read one profile's persisted saved-window snapshots from disk.
+
+    Args:
+        profile (str): Target browser-proxy profile — one JSON file per profile, never shared.
+
+    Returns:
+        dict[str, Any]: ``{name: {"saved_at", "bounds", "layout"}}``, or ``{}`` for a profile with
+        no saved windows yet, or a genuinely corrupt file — never raises, a saved-window store is
+        additive convenience state, not a source of truth the daemon must trust unconditionally.
+
+    Examples:
+        >>> isinstance(_load_saved_windows("does-not-exist-xyz"), dict)
+        True
+        >>> _load_saved_windows.__name__
+        '_load_saved_windows'
+    """
+    path = saved_windows_path(profile)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_saved_windows(profile: str, store: dict[str, Any]) -> None:
+    """Purpose: persist one profile's saved-window snapshots to disk.
+
+    Args:
+        profile (str): Target browser-proxy profile.
+        store (dict[str, Any]): Complete replacement mapping (never a partial merge — callers
+            read-modify-write the full dict via ``_load_saved_windows`` first).
+
+    Returns:
+        None. Creates the parent directory (mode ``0o700``, same as an Edge profile directory)
+        the first time a profile saves a window.
+
+    Examples:
+        >>> callable(_write_saved_windows)
+        True
+        >>> _write_saved_windows.__name__
+        '_write_saved_windows'
+    """
+    path = saved_windows_path(profile)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_text(json.dumps(store, indent=2))
+
+
+def _layout_from_chrome_layout(chrome_layout: dict[str, Any]) -> list[dict[str, Any]]:
+    """Purpose: convert a REAL window's canonical `chrome_layout` into a `window-create`-shaped
+    `layout` (URLs, not live ids) — the one conversion `window-save` needs to turn a live window
+    into a re-creatable snapshot.
+
+    Args:
+        chrome_layout (dict[str, Any]): One window's `window-list`-style `chrome_layout` (`tabs`,
+            `groups`, `order` — see `_window_list`/`computeWindowLayouts`).
+
+    Returns:
+        list[dict[str, Any]]: Same shape `window-create`/`group-sync` accept: `{"type":"tab",
+        "url":...}` or `{"type":"group","title":...,"color"?:...,"tabs":[url,...]}`, in the exact
+        real visual order. A tab/group whose member tabs cannot be resolved to a URL is skipped
+        (never a broken entry with a missing field) rather than aborting the whole snapshot.
+
+    Examples:
+        >>> _layout_from_chrome_layout({"tabs": [{"chrome_tab_id": 1, "url": "https://a.example"}], \
+"groups": {}, "order": [{"kind": "tab", "chrome_tab_id": 1}]})
+        [{'type': 'tab', 'url': 'https://a.example'}]
+        >>> _layout_from_chrome_layout({"tabs": [], "groups": {}, "order": []})
+        []
+    """
+    urls_by_tab_id: dict[int, str] = {
+        tab["chrome_tab_id"]: str(tab.get("url", "")) for tab in chrome_layout.get("tabs", [])
+    }
+    layout: list[dict[str, Any]] = []
+    for entry in chrome_layout.get("order", []):
+        if entry.get("kind") == "tab":
+            url = urls_by_tab_id.get(entry.get("chrome_tab_id"))
+            if url:
+                layout.append({"type": "tab", "url": url})
+        elif entry.get("kind") == "group":
+            tabs = [
+                urls_by_tab_id[tab_id]
+                for tab_id in entry.get("tabs", [])
+                if tab_id in urls_by_tab_id
+            ]
+            if not tabs:
+                continue
+            group_entry: dict[str, Any] = {
+                "type": "group",
+                "title": str(entry.get("title", "")),
+                "tabs": tabs,
+            }
+            if entry.get("color"):
+                group_entry["color"] = entry["color"]
+            layout.append(group_entry)
+    return layout
+
+
+@require_preflight("profile", "saves")
+async def _window_save(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: snapshot one or MORE real windows' full structure to disk, batch, by name — the
+    save half of a browser-proxy-native "workspace" (KπX, GRAVÉ: real Edge Workspaces expose no
+    programmatic API at all — see `## Workspaces`; this is our own honest substitute).
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty `saves`: a list of
+            `{"window_id": int, "name": str}` — several windows saved in ONE call, each under its
+            own name, never one call per window.
+        context (DaemonContext): Daemon state used to resolve the profile and the paired
+            extension (required — a snapshot with no real group/order context would be a lie).
+
+    Returns:
+        dict[str, Any]: Profile and, per entry, `{"name", "window_id", "tab_count"}` confirming
+        what was actually saved.
+
+    Raises:
+        ValueError: `saves` malformed or empty, or an entry missing `window_id`/`name`.
+        RuntimeError: `CDP_UNAVAILABLE` for a `window_id` that does not exist right now;
+            `EXTENSION_UNAVAILABLE` if that window's real tab/group structure cannot be read.
+
+    Notes:
+        Deliberately NOT `@require_approval` — reading a window's current structure and writing it
+        to a local JSON file touches nothing live in the browser, no different in kind from
+        `bookmark-create`'s own non-secret persistence. Re-saving an existing name overwrites it
+        (a save slot, not an append-only log — matches the operator's own mental model of "save").
+
+    Examples:
+        >>> _window_save.__name__
+        '_window_save'
+        >>> callable(_window_save)
+        True
+    """
+    profile = str(payload.get("profile", "default"))
+    saves = payload.get("saves")
+    if not isinstance(saves, list) or not saves:
+        raise ValueError("saves must be a non-empty list of {window_id, name}")
+    window_view = await _window_list(payload, context)
+    windows_by_id = {window["window_id"]: window for window in window_view["windows"]}
+    store = _load_saved_windows(profile)
+    saved: list[dict[str, Any]] = []
+    for index, entry in enumerate(saves):
+        if not isinstance(entry, dict) or "window_id" not in entry or "name" not in entry:
+            raise ValueError(f"saves[{index}] must be an object with window_id and name")
+        window_id = int(entry["window_id"])
+        name = str(entry["name"])
+        window = windows_by_id.get(window_id)
+        if window is None:
+            raise RuntimeError(f"CDP_UNAVAILABLE: no live window {window_id} in profile {profile}")
+        chrome_layout = window.get("chrome_layout")
+        if chrome_layout is None:
+            raise RuntimeError(
+                f"EXTENSION_UNAVAILABLE: {profile} (cannot snapshot window {window_id} without "
+                "the paired extension's real tab/group structure)"
+            )
+        store[name] = {
+            "saved_at": datetime.now(UTC).isoformat(),
+            "bounds": window.get("bounds", {}),
+            "layout": _layout_from_chrome_layout(chrome_layout),
+        }
+        saved.append(
+            {"name": name, "window_id": window_id, "tab_count": len(chrome_layout["tabs"])}
+        )
+    _write_saved_windows(profile, store)
+    return {"profile": profile, "saved": saved}
+
+
+@require_preflight("profile", "names")
+async def _window_restore(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: reopen one or MORE saved windows by name, batch, as real new windows.
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty `names` — several saved windows
+            restored in ONE call, never one call per window.
+        context (DaemonContext): Daemon state used to resolve the profile and the paired
+            extension (required whenever a saved layout includes a group).
+
+    Returns:
+        dict[str, Any]: Profile and, per name, `{"name", "window_id", "layout"}` — the SAME
+        `window-create` result shape, since restoring genuinely IS `window-create` under the hood.
+
+    Raises:
+        ValueError: `names` malformed or empty.
+        RuntimeError: `NOT_FOUND: <name>` for any name with no saved snapshot in this profile.
+
+    Notes:
+        Deliberately NOT `@require_approval` — same rationale as `window-create`: every restored
+        window is real and visible the instant it opens, directly observable. Bounds are restored
+        via `window-create`'s own flat `left`/`top`/`width`/`height`/`windowState` fields — the
+        SAME convention, never a second nested shape for the same concept.
+
+    Examples:
+        >>> _window_restore.__name__
+        '_window_restore'
+        >>> callable(_window_restore)
+        True
+    """
+    profile = str(payload.get("profile", "default"))
+    names = payload.get("names")
+    if not isinstance(names, list) or not names:
+        raise ValueError("names must be a non-empty list of saved window names")
+    store = _load_saved_windows(profile)
+    restored: list[dict[str, Any]] = []
+    for name in names:
+        entry = store.get(str(name))
+        if entry is None:
+            raise RuntimeError(f"NOT_FOUND: no saved window named {name!r} in profile {profile}")
+        create_payload: dict[str, Any] = {"profile": profile, "layout": entry["layout"]}
+        bounds = entry.get("bounds") or {}
+        for key in ("left", "top", "width", "height", "windowState"):
+            if key in bounds:
+                create_payload[key] = bounds[key]
+        result = await _window_create(create_payload, context)
+        restored.append(
+            {"name": str(name), "window_id": result["window_id"], "layout": result["layout"]}
+        )
+    return {"profile": profile, "restored": restored}
+
+
+@require_preflight("profile")
+async def _window_saved_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: list every saved window snapshot for one profile.
+
+    Args:
+        payload (dict[str, Any]): Object containing a started `profile` name.
+        context (DaemonContext): Unused — a pure local-disk read, no CDP/extension needed.
+
+    Returns:
+        dict[str, Any]: Profile and `windows`: one entry per saved name, `{"name", "saved_at",
+        "bounds", "tab_count", "layout"}` — the full `layout` is included (not just a summary) so
+        a caller can preview exactly what `window-restore` would recreate before running it.
+
+    Examples:
+        >>> _window_saved_list.__name__
+        '_window_saved_list'
+        >>> callable(_window_saved_list)
+        True
+    """
+    profile = str(payload.get("profile", "default"))
+    store = _load_saved_windows(profile)
+    windows = [
+        {
+            "name": name,
+            "saved_at": entry.get("saved_at"),
+            "bounds": entry.get("bounds", {}),
+            "tab_count": sum(
+                len(item["tabs"]) if item["type"] == "group" else 1
+                for item in entry.get("layout", [])
+            ),
+            "layout": entry.get("layout", []),
+        }
+        for name, entry in store.items()
+    ]
+    return {"profile": profile, "windows": windows}
+
+
+@require_preflight("profile", "names")
+async def _window_saved_remove(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: permanently delete one or MORE saved window snapshots by name, batch.
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty `names` — several removed in
+            ONE call, never one call per snapshot; every name must exist, explicitly, no wildcard
+            "delete all" shortcut.
+        context (DaemonContext): Unused — a pure local-disk write, no CDP/extension needed.
+
+    Returns:
+        dict[str, Any]: Profile and `removed`: the exact names deleted.
+
+    Raises:
+        ValueError: `names` malformed or empty.
+        RuntimeError: `NOT_FOUND: <name>` for any name that does not exist — checked for ALL names
+            BEFORE deleting any of them, so a batch call is all-or-nothing, never a partial delete
+            silently leaving the store in a state the caller never asked for.
+
+    Notes:
+        Deliberately NOT `@require_approval` — same rationale as `profile-remove`: this never
+        touches a live browser window at all (pure local JSON file edit), so gating it behind an
+        extension overlay would add a dependency the action does not actually need; the locked,
+        explicit-name-only identity (no wildcard) is the real safety net here, same admin-tier
+        pattern as `profile-remove`.
+
+    Examples:
+        >>> _window_saved_remove.__name__
+        '_window_saved_remove'
+        >>> callable(_window_saved_remove)
+        True
+    """
+    profile = str(payload.get("profile", "default"))
+    names = payload.get("names")
+    if not isinstance(names, list) or not names:
+        raise ValueError("names must be a non-empty list of saved window names")
+    store = _load_saved_windows(profile)
+    for name in names:
+        if str(name) not in store:
+            raise RuntimeError(f"NOT_FOUND: no saved window named {name!r} in profile {profile}")
+    for name in names:
+        del store[str(name)]
+    _write_saved_windows(profile, store)
+    return {"profile": profile, "removed": [str(name) for name in names]}
+
+
+async def _tabs_with_context(
+    payload: dict[str, Any], context: DaemonContext
+) -> tuple[str, list[dict[str, Any]]]:
+    """Purpose: build the flat per-tab view enriched with its REAL window and group/folder context.
+
+    Args:
+        payload (dict[str, Any]): Object containing a started ``profile`` name.
+        context (DaemonContext): Daemon state used to resolve that profile and, when connected,
+            the paired extension.
+
+    Returns:
+        tuple[str, list[dict[str, Any]]]: Profile name and one entry per real page target, each
+        the pre-existing ``Target.getTargets`` shape PLUS ``window_id`` (the real Edge window it
+        lives in — never omitted, resolved via the SAME ``Browser.getWindowForTarget`` mechanism
+        ``window-list`` uses) and ``group_id``/``group_title`` (the real Edge tab-group/"folder" it
+        is in, both ``None`` when ungrouped or when the extension is not connected — an honest
+        degradation, never a silent guess). Root-caused live (KπX): "tab-list doit indiquer ds
+        quel fenêtre est la tab, ds quel dossier c'est si c'est ds un dossier" — a flat tab list
+        with zero window/folder context gave no way to recognize which tab is which without
+        cross-referencing `window-list` by hand. Reuses `_window_list` entirely rather than a
+        second, independently-computed view (single source of truth for window/group grouping).
+
+    Examples:
+        >>> asyncio.iscoroutinefunction(_tabs_with_context)
+        True
+        >>> callable(_tabs_with_context)
+        True
+    """
+    window_view = await _window_list(payload, context)
+    tabs: list[dict[str, Any]] = []
+    for window in window_view["windows"]:
+        chrome_layout = window.get("chrome_layout")
+        groups: dict[str, Any] = chrome_layout.get("groups", {}) if chrome_layout else {}
+        chrome_by_target: dict[str | None, dict[str, Any]] = {}
+        if chrome_layout:
+            for chrome_tab in chrome_layout.get("tabs", []):
+                chrome_by_target[chrome_tab.get("target_id")] = chrome_tab
+        for tab in window["tabs"]:
+            entry = dict(tab)
+            entry["window_id"] = window["window_id"]
+            chrome_tab = chrome_by_target.get(tab["targetId"])
+            group_id = chrome_tab.get("group_id") if chrome_tab else None
+            entry["group_id"] = group_id
+            entry["group_title"] = (
+                groups.get(str(group_id), {}).get("title") if group_id is not None else None
+            )
+            tabs.append(entry)
+    return window_view["profile"], tabs
 
 
 async def _tab_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: list all page tabs in a persistent Edge profile.
+    """Purpose: list all page tabs in a persistent Edge profile, with real window+folder context.
 
     Args:
         payload (dict[str, Any]): Object containing a started ``profile`` name.
         context (DaemonContext): Daemon state used to resolve the profile.
 
     Returns:
-        dict[str, Any]: Profile name and its Edge page targets as tabs.
+        dict[str, Any]: Profile name and its Edge page targets as tabs, each carrying
+        ``window_id``/``group_id``/``group_title`` (see ``_tabs_with_context``).
 
     Examples:
         >>> _tab_list.__name__
@@ -539,65 +1140,75 @@ async def _tab_list(payload: dict[str, Any], context: DaemonContext) -> dict[str
         >>> callable(_tab_list)
         True
     """
-    name, browser = _profile(payload, context)
-    return {"profile": name, "tabs": await _page_targets(browser)}
+    profile, tabs = await _tabs_with_context(payload, context)
+    return {"profile": profile, "tabs": tabs}
 
 
-async def _page_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: list inspectable Edge page targets and CDP metadata.
-
-    Args:
-        payload (dict[str, Any]): Object containing a started ``profile`` name.
-        context (DaemonContext): Daemon state used to resolve the profile.
-
-    Returns:
-        dict[str, Any]: Profile name and inspectable CDP page target records.
-
-    Examples:
-        >>> _page_list.__name__
-        '_page_list'
-        >>> callable(_page_list)
-        True
-    """
-    profile, browser = _profile(payload, context)
-    return {"profile": profile, "pages": await _page_targets(browser)}
-
-
-async def _page_get(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: read one Edge page target's public CDP metadata.
+async def _tab_get(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: read ALL available information about ONE tab in a single comprehensive call.
 
     Args:
         payload (dict[str, Any]): Profile and required CDP ``target_id``.
         context (DaemonContext): Daemon state used to resolve the profile.
 
     Returns:
-        dict[str, Any]: Profile name and the selected page target metadata.
+        dict[str, Any]: Profile name and one merged ``tab`` object — the real, raw
+        ``Target.getTargetInfo`` CDP metadata (title, url, type, attached, ``browserContextId``,
+        ...) PLUS the SAME ``window_id``/``group_id``/``group_title`` context ``tab-list`` exposes.
+        Replaces the former ``page-get`` (KπX directive, GRAVÉ: "tab = page ... je ne veux pas de
+        duplication inutile" — ``page-get`` was a second, narrower "get one tab's identity" action
+        with zero window/group context; merged here as the single source, never two overlapping
+        ways to read one tab's identity).
+
+    Raises:
+        ValueError: ``target_id`` missing.
+        RuntimeError: ``CDP_UNAVAILABLE: ...`` when no live tab matches ``target_id``.
 
     Examples:
-        >>> _page_get.__name__
-        '_page_get'
-        >>> callable(_page_get)
+        >>> _tab_get.__name__
+        '_tab_get'
+        >>> callable(_tab_get)
         True
     """
-    profile, browser = _profile(payload, context)
+    name, browser = _profile(payload, context)
     target_id = str(payload.get("target_id", ""))
     if not target_id:
         raise ValueError("target_id is required")
-    result = await browser.call("Target.getTargetInfo", {"targetId": target_id})
-    return {"profile": profile, "page": result.get("targetInfo", {})}
+    _, tabs = await _tabs_with_context(payload, context)
+    match = next((tab for tab in tabs if tab.get("targetId") == target_id), None)
+    if match is None:
+        raise RuntimeError(f"CDP_UNAVAILABLE: no live tab found for target_id {target_id}")
+    raw = await browser.call("Target.getTargetInfo", {"targetId": target_id})
+    return {"profile": name, "tab": {**match, **raw.get("targetInfo", {})}}
 
 
 @require_preflight("profile")
 @require_verification("url")
 async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: create a tab in Edge, optionally in a new window.
+    """Purpose: create a tab in Edge — as fine-grained as the possibilities allow: optionally in a
+    specific EXISTING window, optionally into an existing group/folder, optionally at a precise
+    position — never just "create somewhere and hope it lands right" (KπX directive: "on doit être
+    le plus fin possible... donner l'illusion d'un aspect esthétique visuel, pas juste créer du
+    bullshit").
 
     Args:
-        payload (dict[str, Any]): Profile, URL, and optional ``new_window`` boolean.
-        context (DaemonContext): Daemon state used to resolve the profile.
+        payload (dict[str, Any]): Profile, ``url``, optional ``new_window`` (bool — a genuinely new
+            window instead of the current one), optional ``window_id`` (open directly in that
+            EXISTING window instead — mutually exclusive with ``new_window``), optional ``group_id``
+            (add the new tab into that EXISTING group/folder the instant it is created), and at
+            most one position hint (``index``/``before_tab_id``/``after_tab_id``, same convention
+            as ``tab-update``).
+        context (DaemonContext): Daemon state used to resolve the profile and, when ``group_id`` or
+            a position is requested, the paired extension (to capture the real chrome tab id and
+            apply the placement via the SAME ``tab.update`` mechanism ``tab-update`` uses).
 
     Returns:
-        dict[str, Any]: Profile, target ID, and requested URL for the tab.
+        dict[str, Any]: Profile, CDP ``target_id``, requested ``url`` — plus, whenever a real
+        chrome tab id was resolved, ``tab_id`` and (when a placement was requested) the
+        extension-confirmed ``window_id``/``group_id``/``index`` after that placement.
+
+    Raises:
+        ValueError: Both ``new_window`` and ``window_id`` given (ambiguous intent).
 
     Notes:
         Deliberately NOT ``@require_approval`` (KπX directive, same rationale as
@@ -612,16 +1223,48 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
     """
     name, browser = _profile(payload, context)
     url = str(payload.get("url", "about:blank"))
-    result = await browser.call(
-        "Target.createTarget", {"url": url, "newWindow": bool(payload.get("new_window", False))}
+    new_window = bool(payload.get("new_window", False))
+    raw_window_id = payload.get("window_id")
+    if new_window and raw_window_id is not None:
+        raise ValueError("new_window and window_id are mutually exclusive")
+    group_id = payload.get("group_id")
+    position_fields = ("index", "before_tab_id", "after_tab_id")
+    wants_position = any(payload.get(field) is not None for field in position_fields)
+    needs_chrome_id = group_id is not None or wants_position
+
+    target_id, chrome_tab_id = await _create_window_tab(
+        browser,
+        context,
+        name,
+        int(raw_window_id) if raw_window_id is not None else None,
+        url,
+        capture_chrome_id=needs_chrome_id,
+        new_window=new_window,
     )
-    return {"profile": name, "target_id": result["targetId"], "url": url}
+    outcome: dict[str, Any] = {"profile": name, "target_id": target_id, "url": url}
+    if chrome_tab_id is None:
+        return outcome
+    outcome["tab_id"] = chrome_tab_id
+    update_fields: dict[str, Any] = {}
+    if group_id is not None:
+        update_fields["group_id"] = group_id
+    for field in position_fields:
+        if payload.get(field) is not None:
+            update_fields[field] = payload[field]
+    if not update_fields:
+        return outcome
+    updated = await context.extension_request(
+        "tab.update", {"profile": name, "tab_id": chrome_tab_id, **update_fields}, name
+    )
+    outcome["window_id"] = updated.get("window_id")
+    outcome["group_id"] = updated.get("group_id")
+    outcome["index"] = updated.get("index")
+    return outcome
 
 
-@require_approval
 @require_preflight("profile", "target_id")
 async def _tab_activate(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: activate an existing Edge tab target.
+    """Purpose: activate an existing Edge tab target — bring it to the front as the visible tab.
 
     Args:
         payload (dict[str, Any]): Profile and required CDP ``target_id``.
@@ -629,6 +1272,14 @@ async def _tab_activate(payload: dict[str, Any], context: DaemonContext) -> dict
 
     Returns:
         dict[str, Any]: Profile, activated target ID, and activation state.
+
+    Notes:
+        Deliberately NOT ``@require_approval`` anymore (KπX directive, root-caused live): activating
+        an already-open, already-visible tab is directly observable the instant it happens — same
+        rationale as ``tab-create``/``window-create``/``tab-update``. Its role is purely navigational
+        focus (bring a specific already-open tab to the front, e.g. to make it the active tab before
+        a screenshot/interaction, or to surface a background tab KπX should look at) — it never
+        creates, closes, or mutates any content, so it carries no more risk than looking at a window.
 
     Examples:
         >>> _tab_activate.__name__
@@ -644,29 +1295,47 @@ async def _tab_activate(payload: dict[str, Any], context: DaemonContext) -> dict
     return {"profile": name, "target_id": target_id, "active": True}
 
 
-async def _workspace_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: return a heuristic Workspace view derived from Edge tab targets.
+@require_preflight("tab_id")
+async def _tab_update(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: the ONE fine-grained way to change anything about one real, already-open tab — its
+    url, its window, its group/folder, or its position — any subset of these, in one call.
 
     Args:
-        payload (dict[str, Any]): Object containing a started ``profile`` name.
-        context (DaemonContext): Daemon state used to resolve the profile.
+        payload (dict[str, Any]): Profile, required ``tab_id`` (the REAL numeric
+            ``chrome.tabs.Tab.id`` — see ``window-list``'s ``chrome_layout``/``group-list``, never
+            a CDP ``target_id``), and ANY combination of: ``url`` (navigate this tab in place),
+            ``window_id`` (move it to another window), ``group_id`` (move it into that
+            group/folder — explicit ``null`` removes it from its current group), and AT MOST ONE
+            of ``index`` (``-1`` moves to the end), ``before_tab_id``, or ``after_tab_id`` — the
+            same primitive a mouse drag performs.
+        context (DaemonContext): Daemon state exposing the paired extension.
 
     Returns:
-        dict[str, Any]: Explicitly non-authoritative Workspace-like tab container.
+        dict[str, Any]: Extension-confirmed ``{tab_id, url, index, window_id, group_id}`` reflecting
+        the tab's real state after every requested change.
+
+    Raises:
+        ValueError: No field beyond ``tab_id`` given at all (a no-op call is rejected, never
+            silently accepted).
+
+    Notes:
+        Renamed from ``tab-move`` (KπX directive, GRAVÉ: "renomme en tab-update... url, window,
+        folder, index... centralise vraiment tout cela pour redistribuer partout cette philo de
+        fin ajustement") — one deliberate command for every fine, surgical adjustment a tab can
+        need, never N separate primitive calls for what is conceptually ONE placement decision.
+        Deliberately NOT ``@require_approval`` — adjusting an already-visible tab is directly
+        observable the instant it happens, the same rationale as ``window-create``/``tab-create``.
 
     Examples:
-        >>> _workspace_list.__name__
-        '_workspace_list'
-        >>> callable(_workspace_list)
+        >>> _tab_update.__name__
+        '_tab_update'
+        >>> callable(_tab_update)
         True
     """
-    name, browser = _profile(payload, context)
-    return {
-        "profile": name,
-        "heuristic": True,
-        "authority": "none",
-        "workspaces": [{"name": "ungrouped", "tabs": await _page_targets(browser)}],
-    }
+    fields = ("url", "window_id", "group_id", "index", "before_tab_id", "after_tab_id")
+    if not any(field in payload for field in fields):
+        raise ValueError("tab-update requires at least one of: " + ", ".join(fields))
+    return await _extension(payload, context, "tab.update")
 
 
 async def _group_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -1702,6 +2371,90 @@ async def _group_move(payload: dict[str, Any], context: DaemonContext) -> dict[s
     return await _extension(payload, context, "group.move")
 
 
+@require_preflight("group_id")
+async def _group_add_tabs(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: add existing real tabs into an ALREADY-CREATED Edge tab group.
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``group_id`` (an existing group — never
+            creates a new one, unlike ``group-create``), and required ``tab_ids`` (real numeric
+            ``chrome.tabs.Tab.id`` values, never CDP ``target_id`` strings).
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{group_id, tab_ids}`` now inside that group.
+
+    Notes:
+        Deliberately NOT ``@require_approval`` — dragging an already-visible tab into an
+        already-visible group is directly observable the instant it happens.
+
+    Examples:
+        >>> _group_add_tabs.__name__
+        '_group_add_tabs'
+        >>> callable(_group_add_tabs)
+        True
+    """
+    return await _extension(payload, context, "group.add_tabs")
+
+
+@require_approval
+@require_preflight("tab_ids")
+async def _group_remove_tabs(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: remove real tabs from their Edge tab group WITHOUT closing them.
+
+    Args:
+        payload (dict[str, Any]): Profile and required ``tab_ids`` (real numeric
+            ``chrome.tabs.Tab.id`` values to ungroup).
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{tab_ids, ungrouped: true}``.
+
+    Notes:
+        Now ``@require_approval`` (KπX directive, GRAVÉ — a reversal from the original "same
+        rationale as ``group-add-tabs``" stance): removing tabs from a named group is treated as a
+        reviewable structural change, unlike ``group-add-tabs`` which stays ungated.
+
+    Examples:
+        >>> _group_remove_tabs.__name__
+        '_group_remove_tabs'
+        >>> callable(_group_remove_tabs)
+        True
+    """
+    return await _extension(payload, context, "group.remove_tabs")
+
+
+@require_approval
+@require_preflight("layout")
+async def _group_sync(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: reorganize a WHOLE window's tab/group structure in ONE call — absolute flexibility.
+
+    Args:
+        payload (dict[str, Any]): Profile and required ``layout``: an ORDERED list processed left
+            to right, each entry either ``{"type":"tab","tab_id":N}`` (a standalone, ungrouped tab
+            at this position) or ``{"type":"group","group_id":N|omitted,"title":str,"color":str,
+            "tab_ids":[N,...]}`` (a whole group at this position — ``group_id`` given reuses/
+            renames/recolors/adds-to that EXACT existing group; omitted creates a brand-new group).
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{layout: [...]}`` — one entry per input entry, same
+        order, each carrying the real ``tab_id`` or the real (possibly newly created) ``group_id``.
+
+    Notes:
+        Now ``@require_approval`` (KπX directive, GRAVÉ — a reversal from the original
+        "deliberately not approval-gated" stance): reorganizing a whole window's structure is now
+        treated as one deliberate, reviewable command, same as its new sibling ``window-sync``.
+
+    Examples:
+        >>> _group_sync.__name__
+        '_group_sync'
+        >>> callable(_group_sync)
+        True
+    """
+    return await _extension(payload, context, "group.sync")
+
+
 async def _browser_ask_user(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: ask the human operator a question through the paired extension overlay.
 
@@ -1893,12 +2646,16 @@ REGISTRY = {
         _action("window-list", "Windows", _window_list),
         _action("window-create", "Windows", _window_create),
         _action("window-close", "Windows", _window_close),
+        _action("window-sync", "Windows", _window_sync),
+        _action("window-save", "Windows", _window_save),
+        _action("window-restore", "Windows", _window_restore),
+        _action("window-saved-list", "Windows", _window_saved_list),
+        _action("window-saved-remove", "Windows", _window_saved_remove),
         _action("tab-list", "Tabs", _tab_list),
-        _action("page-list", "Pages", _page_list),
-        _action("page-get", "Pages", _page_get),
+        _action("tab-get", "Tabs", _tab_get),
         _action("tab-create", "Tabs", _tab_create),
         _action("tab-activate", "Tabs", _tab_activate),
-        _action("workspace-list", "Workspaces", _workspace_list),
+        _action("tab-update", "Tabs", _tab_update),
         _action("group-list", "Groups", _group_list),
         _action("bookmark-list", "Bookmarks", _bookmark_list),
         _action("bookmark-create", "Bookmarks", _bookmark_create),
@@ -1929,6 +2686,9 @@ REGISTRY = {
         _action("group-create", "Groups", _group_create),
         _action("group-update", "Groups", _group_update),
         _action("group-move", "Groups", _group_move),
+        _action("group-add-tabs", "Groups", _group_add_tabs),
+        _action("group-remove-tabs", "Groups", _group_remove_tabs),
+        _action("group-sync", "Groups", _group_sync),
         _action("browser-ask-user", "HumanInTheLoop", _browser_ask_user),
         _action("browser-dismiss-overlays", "HumanInTheLoop", _browser_dismiss_overlays),
         _action("browser-solve-captcha", "HumanInTheLoop", _browser_solve_captcha),

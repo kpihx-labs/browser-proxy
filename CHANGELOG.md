@@ -2,6 +2,78 @@
 
 ## 0.5.0 - 2026-08-29
 
+- **HITL transparency, redirection, and one-shot reorganization (KπX directives, all live-verified
+  during real testing)**:
+  - Every HITL prompt now shows the REAL non-secret proposal details (`describeApprovalDetails()` —
+    real `tab_ids`, `title`, `color`, `url`, …), never just a bare action name; only genuinely
+    secret-shaped fields (`value`, `content_base64`, `password`) are shown as `<redacted>`.
+  - Every HITL-hosting tab is now actively focused, tab AND window, before the prompt shows
+    (`focusHostTab()`) — never a prompt KπX has to discover by accident (confirmed live: a
+    temporary tab appeared unnoticed during earlier testing).
+  - `sendToHostTab()` centralizes the same tab-resolution/focus/stale-content-script-retry
+    `requestApproval()` already had across all 6 non-approval HITL kinds (`user.ask`,
+    `overlay.dismiss`, `captcha.solve`, `form.set_date`, `form.set_combobox`, `form.drop_file`) —
+    never six hand-duplicated copies.
+  - Fixed a real temporary-tab leak: expiry was a plain `setTimeout`, silently discarded if the
+    service worker is evicted before it fires (confirmed live: a temporary `https://example.com`
+    tab stayed open for many minutes across several turns after one approval was abandoned
+    mid-flow). Now armed via `chrome.alarms` (`armApprovalExpiryAlarm()`), which always survives
+    eviction — same pattern as the reconnect watchdog.
+  - New **`do group-sync`**: reorganizes a WHOLE window's tab/group layout in ONE call — create,
+    rename, recolor, add-to, remove-from, and reposition, all at once (`{"layout": [{"type":"tab",
+    "tab_id"}|{"type":"group","group_id"?,"title"?,"color"?,"tab_ids"}]}`), never N separate
+    primitive calls for one deliberate rearrangement. Deliberately not approval-gated, same
+    rationale as `tab-move`/`group-add-tabs`/`group-remove-tabs`.
+  - Extension test suite gained a `FakeWebSocket` (replacing a real, unmocked `WebSocket` that used
+    to attempt a genuine loopback connection at every test run) — root-caused a real, confirmed-live
+    test flake where the real socket's delayed `close` event unpredictably rejected unrelated
+    in-flight content-script replies later in the suite.
+  - 9 new TypeScript tests (transparency ×2, redirect ×1, sendToHostTab centralization ×2,
+    group.sync ×3, plus the FakeWebSocket fix) plus the new `do group-sync` action registered
+    Python-side, all green.
+- **Removed the daemon's automatic timeout entirely — no idle TTL, no maximum lifetime (KπX
+  directive, GRAVÉ)**: an idle-suspended-while-connected TTL (the previous fix) still resumed and
+  killed the WHOLE daemon — CDP included — the instant the extension bridge merely dropped for any
+  unrelated reason (network blip, an old un-reloaded extension build, computer sleep), confirmed
+  live via `journalctl` showing repeated daemon restarts unrelated to genuine inactivity. `Daemon()`
+  now takes no lifecycle configuration at all (`idle_seconds`/`max_lifetime_seconds` removed, not
+  merely defaulted huge); `_await_explicit_stop()` is the ONLY stop path, blocking forever on
+  `self._stop` until the `shutdown` RPC sets it. The systemd unit's own `RuntimeMaxSec=8h` was
+  removed too — a second, independent automatic-timeout mechanism enforcing the exact same thing
+  one layer lower. Every managed Edge window is already always visible, so KπX can directly see and
+  close one an agent forgot — there is no case where an unattended timeout is the right way to
+  reclaim a daemon. `admin stop` was also fixed as a direct consequence: it only ran `systemctl
+  --user stop`, silently no-oping for a daemon systemd never launched (root-caused a real hang in
+  `make smoke`'s isolated test daemon, previously masked by the idle-TTL fallback this pass
+  removed) — it now sends the real `shutdown` RPC over the socket FIRST (works identically whether
+  systemd-managed or not), falling back to `systemctl stop` only if the socket is unreachable.
+- **Purged `.env`/`.env.example`**: no code in this repo reads a dotenv file at runtime (every
+  override reads `os.environ` directly); every default value and its overriding environment
+  variable name already lives solely in `src/browser_proxy/config.py`, making a checked-in
+  `.env.example` pure redundant, driftable documentation.
+- **Canonical tab/group structure refonte (KπX request — "penser structure, pas patcher après
+  coup")**: `tab-list` used to be flat CDP targets with zero group awareness; `group-list` was a
+  disconnected extension-sourced view with its own numeric ids — no way to answer "which tab is in
+  which group" or "what's the real visual order" without manual cross-referencing, because CDP has
+  no concept of tab groups or real tab `index` at all (only `chrome.tabs.query`/
+  `chrome.tabGroups.query`, extension-side, can answer it). New `computeWindowLayouts()`
+  (`background.ts`) computes the ONE real truth per window in a single pass — a flat ordered
+  `tabs` list (each carrying its own `group_id`, `null` if ungrouped), pure `groups` metadata, and
+  `order` (the exact visual left-to-right sequence Edge itself renders, standalone tabs interleaved
+  with contiguous group blocks) — all 3 pure projections of the identical snapshot, never
+  independently re-fetched. `window-list` gained `chrome_layout: {tabs, groups, order} | null` per
+  window (`null` only when the extension is disconnected — honest degradation, never a guess);
+  `group-list` now derives from the same computation (gained `window_id`/`collapsed`, unchanged
+  pre-existing shape otherwise). New `_correlate_cdp_targets()` bridges the two genuinely separate
+  identifier systems (CDP `target_id` vs. real `chrome.tabs.Tab.id`) by URL in left-to-right
+  encounter order, deterministic even for duplicate URLs.
+  New actions **`tab-move`** (`chrome.tabs.move` — `index`/`before_tab_id`/`after_tab_id`,
+  optional cross-window `window_id`), **`group-add-tabs`** (`chrome.tabs.group({tabIds,groupId})`
+  — adds to an EXISTING group, never creates one), **`group-remove-tabs`**
+  (`chrome.tabs.ungroup` — removes without closing) — the same primitives a mouse drag performs.
+  All 3 deliberately NOT `@require_approval`-gated, same rationale as `window-create`/`tab-create`
+  (a known asymmetry with the pre-existing `group-create`/`group-update`/`group-move`, left
+  unchanged, not yet resolved). 20 new tests (10 Python, 10 TypeScript), all green.
 - **`window-create` gained an optional `items` field building a whole ordered tab/group layout in
   one call** (KπX request): `[{"type":"tab","url":"..."}, {"type":"group","title":"...","tabs":
   ["url1","url2"]}, ...]`, processed strictly in order, every tab landing in the SAME new window
