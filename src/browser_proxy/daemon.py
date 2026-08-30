@@ -364,6 +364,17 @@ class Daemon:
         Returns:
             dict[str, Any]: Object-valued successful extension response data.
 
+        Raises:
+            RuntimeError: ``EXTENSION_REJECTED: <real message>`` when the extension WAS reachable,
+                received the request, and explicitly declined it with its own specific reason (a
+                validation error, a Chrome platform restriction, an unknown id, ...) — genuinely
+                different from ``EXTENSION_UNAVAILABLE`` (no connection at all) and never collapsed
+                into it: KπX, GRAVÉ — "le code retourne souvent le même code d'erreur qui n'est pas
+                exact" — a real, specific extension-side rejection reason must never be silently
+                discarded and relabeled as if the connection itself were the problem.
+                ``EXTENSION_UNAVAILABLE: <profile> (malformed reply data)`` only for the genuinely
+                separate case of a syntactically broken reply (not a dict at all).
+
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon.extension_request)
             True
@@ -371,11 +382,14 @@ class Daemon:
             False
         """
         reply = await self.bridge.request(kind, payload, profile)
-        if not reply.get("ok"):
-            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}")
         data = reply.get("data", {})
+        if not reply.get("ok"):
+            message = data.get("message") if isinstance(data, dict) else None
+            raise RuntimeError(
+                f"EXTENSION_REJECTED: {message or 'the extension declined this request'}"
+            )
         if not isinstance(data, dict):
-            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}")
+            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile} (malformed reply data)")
         return data
 
     async def _approve(
@@ -565,14 +579,20 @@ class Daemon:
         except ValueError as error:
             code = "RAW_METHOD_DENIED" if str(error) == "RAW_METHOD_DENIED" else "VALIDATION_ERROR"
             return Envelope.error(code, message=str(error))
-        except RuntimeError as error:
-            code = str(error).split(":", 1)[0]
-            known_codes = {
-                "CDP_UNAVAILABLE",
-                "EXTENSION_UNAVAILABLE",
-                "PROFILE_UNAVAILABLE",
-                "NOT_FOUND",
-            }
-            if code not in known_codes:
+        except (RuntimeError, TimeoutError) as error:
+            # Every internal RuntimeError/TimeoutError in this codebase is deliberately raised as
+            # "SOME_REAL_CODE: details" (CDP_ERROR, CDP_UNAVAILABLE, EXTENSION_UNAVAILABLE,
+            # EXTENSION_REJECTED, EXTENSION_TIMEOUT, PROFILE_UNAVAILABLE, NOT_FOUND,
+            # DAEMON_ALREADY_RUNNING, DAEMON_STOP, ...). A fixed whitelist here used to silently
+            # relabel any code NOT on the list back to a misleading "CDP_UNAVAILABLE" the instant a
+            # new one was introduced elsewhere without this list being remembered too (KπX, GRAVÉ:
+            # "le code retourne souvent le même code d'erreur qui n'est pas exact" — confirmed live
+            # against a real "chrome.management.uninstall requires a user gesture" rejection that
+            # this exact bug had been silently discarding). Trust the raiser's own real code instead
+            # of re-deriving/second-guessing it — only an UNRECOGNIZABLE shape (no genuine
+            # "UPPER_SNAKE_CASE: message" prefix at all — a true internal-bug fallback, not a code
+            # we simply forgot to whitelist) falls back to a generic label.
+            code, _, rest = str(error).partition(":")
+            if not (code and rest and code.replace("_", "").isalpha() and code.isupper()):
                 code = "CDP_UNAVAILABLE"
             return Envelope.error(code, message=str(error))

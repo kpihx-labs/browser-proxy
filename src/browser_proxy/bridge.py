@@ -26,6 +26,12 @@ class ExtensionBridge:
     _server: Server | None = None
     _connections: dict[str, ServerConnection] = field(default_factory=dict)
     _pending: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
+    _pending_profile: dict[str, str] = field(default_factory=dict)
+    _last_disconnect_reason: dict[str, str] = field(default_factory=dict)
+    """The REAL reason each profile's connection most recently went away (auth failure, malformed
+    message, an unexpected exception in the connection handler, or a normal close) — surfaced in
+    ``request()``'s ``EXTENSION_UNAVAILABLE`` message so that code is never a bare, unexplained
+    label (KπX, GRAVÉ: "le code retourne souvent le même code d'erreur qui n'est pas exact")."""
 
     def pair(self, token: str) -> None:
         """Purpose: persist an operator-provisioned pairing capability without exposing it in output.
@@ -113,8 +119,9 @@ class ExtensionBridge:
             self._server = None
         for future in self._pending.values():
             if not future.done():
-                future.set_exception(RuntimeError("EXTENSION_UNAVAILABLE"))
+                future.set_exception(RuntimeError("EXTENSION_UNAVAILABLE: bridge stopped"))
         self._pending.clear()
+        self._pending_profile.clear()
         self._connections.clear()
 
     @property
@@ -227,8 +234,15 @@ class ExtensionBridge:
             dict[str, Any]: Typed extension reply with ``ok`` and object-valued ``data``.
 
         Raises:
-            RuntimeError: ``EXTENSION_UNAVAILABLE: <profile>`` when that exact profile has no
-                authenticated connection — even if a different profile's extension is connected.
+            RuntimeError: ``EXTENSION_UNAVAILABLE: <profile> (<reason>)`` when that exact profile
+                has no authenticated connection — even if a different profile's extension is
+                connected. ``<reason>`` is the real, specific cause of the most recent disconnect
+                for THAT profile when one is known (e.g. ``authentication failed``, ``handler
+                error: ...``), never a bare unexplained code — omitted only when no profile of
+                that name has ever connected at all.
+            TimeoutError: ``EXTENSION_TIMEOUT: {profile} (<seconds>s)`` when the connection was
+                open and the request was sent, but no reply ever arrived within the timeout —
+                genuinely distinct from ``EXTENSION_UNAVAILABLE`` (no connection at all).
 
         Examples:
             >>> asyncio.iscoroutinefunction(ExtensionBridge.request)
@@ -239,20 +253,24 @@ class ExtensionBridge:
 
         connection = self._connections.get(profile)
         if connection is None:
-            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}")
+            reason = self._last_disconnect_reason.get(profile)
+            detail = f" ({reason})" if reason else ""
+            raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile}{detail}")
         request_id = secrets.token_urlsafe(12)
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        self._pending_profile[request_id] = profile
         await connection.send(
             json.dumps({"type": "request", "id": request_id, "kind": kind, "payload": payload})
         )
+        effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         try:
-            return await asyncio.wait_for(
-                future,
-                timeout=timeout_seconds if timeout_seconds is not None else self.timeout_seconds,
-            )
+            return await asyncio.wait_for(future, timeout=effective_timeout)
+        except TimeoutError as error:
+            raise TimeoutError(f"EXTENSION_TIMEOUT: {profile} ({effective_timeout}s)") from error
         finally:
             self._pending.pop(request_id, None)
+            self._pending_profile.pop(request_id, None)
 
     async def _handle(self, connection: ServerConnection) -> None:
         """Purpose: authenticate one extension for its declared profile and route its replies.
@@ -265,6 +283,12 @@ class ExtensionBridge:
             None: Closes malformed connections and resolves matching pending requests. A second
             connection declaring the same ``profile`` replaces the first (last-connect-wins), the
             same recovery semantics as a single-profile bridge had before profiles were multiplexed.
+            Whatever REAL reason this profile's connection ends — handshake rejection, a malformed
+            message, an unexpected exception, or a normal close — is recorded in
+            ``_last_disconnect_reason`` and any pending request still in flight FOR THIS PROFILE is
+            failed immediately with that exact reason, instead of silently hanging until the
+            unrelated global ``timeout_seconds``/``stop()`` (KπX, GRAVÉ: "le code retourne souvent
+            le même code d'erreur qui n'est pas exact" — every distinct real cause is now visible).
 
         Examples:
             >>> asyncio.iscoroutinefunction(ExtensionBridge._handle)
@@ -274,11 +298,13 @@ class ExtensionBridge:
         """
 
         profile = ""
+        disconnect_reason = "connection closed"
         try:
             raw = await asyncio.wait_for(connection.recv(), timeout=10)
             message = json.loads(raw)
             if not isinstance(message, dict) or message.get("type") != "handshake":
-                await connection.close(code=4000, reason="handshake required")
+                disconnect_reason = "handshake required"
+                await connection.close(code=4000, reason=disconnect_reason)
                 return
             token = message.get("token")
             expected = self._token()
@@ -287,17 +313,21 @@ class ExtensionBridge:
                 or not expected
                 or not secrets.compare_digest(token.encode(), expected.encode())
             ):
-                await connection.close(code=4001, reason="authentication failed")
+                disconnect_reason = "authentication failed"
+                await connection.close(code=4001, reason=disconnect_reason)
                 return
             if not isinstance(message.get("extension_id"), str):
-                await connection.close(code=4002, reason="extension_id required")
+                disconnect_reason = "extension_id required"
+                await connection.close(code=4002, reason=disconnect_reason)
                 return
             declared_profile = message.get("profile")
             if not isinstance(declared_profile, str) or not declared_profile:
-                await connection.close(code=4004, reason="profile required")
+                disconnect_reason = "profile required"
+                await connection.close(code=4004, reason=disconnect_reason)
                 return
             profile = declared_profile
             self._connections[profile] = connection
+            self._last_disconnect_reason.pop(profile, None)
             await connection.send(
                 json.dumps({"type": "handshake", "status": "accepted", "protocol": 1})
             )
@@ -312,8 +342,25 @@ class ExtensionBridge:
                     and not future.done()
                 ):
                     future.set_result({"ok": bool(reply.get("ok")), "data": reply.get("data", {})})
-        except (TimeoutError, json.JSONDecodeError):
+            disconnect_reason = "connection closed normally"
+        except TimeoutError:
+            disconnect_reason = "handshake did not arrive within 10s"
+        except json.JSONDecodeError as error:
+            disconnect_reason = f"invalid bridge message: {error}"
             await connection.close(code=4003, reason="invalid bridge message")
+        except Exception as error:  # noqa: BLE001 - never let the REAL cause vanish silently
+            disconnect_reason = f"handler error: {error}"
         finally:
             if profile and self._connections.get(profile) is connection:
                 del self._connections[profile]
+                self._last_disconnect_reason[profile] = disconnect_reason
+                stale_ids = [
+                    rid for rid, owner in self._pending_profile.items() if owner == profile
+                ]
+                for request_id in stale_ids:
+                    pending_future = self._pending.pop(request_id, None)
+                    self._pending_profile.pop(request_id, None)
+                    if pending_future is not None and not pending_future.done():
+                        pending_future.set_exception(
+                            RuntimeError(f"EXTENSION_UNAVAILABLE: {profile} ({disconnect_reason})")
+                        )

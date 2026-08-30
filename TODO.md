@@ -25,9 +25,22 @@
   `tab-move`, `group-add-tabs`, and `group-remove-tabs` against a real multi-group Edge window —
   currently only unit/simulated-transport tested, not against a real paired extension.
 - Decide whether to also drop `@require_approval` from the pre-existing `group-create`/
-  `group-update`/`group-move` for consistency with the newer `tab-move`/`group-add-tabs`/
-  `group-remove-tabs`/`group-sync` (all directly-observable already-visible-browser manipulations)
-  — currently an unresolved asymmetry, left untouched pending an explicit decision.
-- Live-verify `do group-sync` against a real multi-group Edge window (only unit/simulated-transport
-  tested so far), and the new HITL transparency/redirection/temp-tab-cleanup fixes end-to-end
-  against a real paired extension.
+  `group-update`/`group-move` for consistency with `tab-update`/`group-add-tabs` (directly-observable
+  already-visible-browser manipulations) — currently an unresolved asymmetry, left untouched
+  pending an explicit decision.
+- Live-verify the new HITL transparency/redirection/temp-tab-cleanup fixes end-to-end against a
+  real paired extension. `group-sync` purged (KπX, GRAVÉ: "purge group-sync vu que inclus ds
+  window-sync") — its former live-verification item is moot; `window-sync`'s `layout` field
+  (strict superset) is now the one to verify instead.
+
+## Post-beta (final phase)
+
+Deliberately left as-is for now (KπX directive: "on va d'abord laisser ainsi... en phase finale
+après phase beta il faudra revoir leur perm si nécessaire") — revisit `@require_approval` for these
+specific `page-*` actions ONLY once the beta phase is over, if still judged necessary then:
+
+- `page-evaluate` — l'action la plus puissante de tout le registre (exécute n'importe quel JS avec
+  les privilèges de la page — vol de cookies, exfiltration, soumission de formulaire...) reste
+  ungated alors que `bookmark-remove`/`extension-disable` le sont pour un risque bien moindre.
+- `page-fill-form`/`page-type` — peuvent injecter des valeurs dans des champs sensibles (mot de
+  passe, paiement).

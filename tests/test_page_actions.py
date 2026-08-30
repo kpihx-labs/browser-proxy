@@ -27,7 +27,6 @@ NEW_ACTIONS = (
     "page-console-list",
     "page-network-list",
     "page-dialog-policy",
-    "page-set-download-behavior",
     "cookie-list",
     "cookie-set",
     "cookie-remove",
@@ -54,8 +53,36 @@ def test_all_new_page_actions_are_registered() -> None:
     # tab-move renamed tab-update so net 0) +4 (window-save/restore/saved-list/saved-remove) = 58;
     # -1 (workspace-list removed: Edge has no supported Workspace API) = 57;
     # +1 (bookmark-update: new fine-grained batch rename/re-url/move/reposition action) = 58;
-    # +1 (bookmark-get: read ALL info about ONE bookmark/folder, same philosophy as tab-get) = 59.
-    assert len(REGISTRY) == 59
+    # +1 (bookmark-get: read ALL info about ONE bookmark/folder, same philosophy as tab-get) = 59;
+    # +6 (extension-list/get/enable/disable/reload/search: chrome.management ecosystem control +
+    # a direct-CDP store search convenience action — extension-uninstall deliberately NOT
+    # implemented, live-verified Chrome platform restriction, see CONTRACT.md) = 65;
+    # -1 (group-sync purged: window-sync without bounds/state/focused is a strict superset of
+    # what it did — KπX, GRAVÉ "purge group-sync vu que inclus ds window-sync") = 64;
+    # -1 (page-set-download-behavior purged, unused/classic ~/Downloads is enough) = 63.
+    assert len(REGISTRY) == 63
+    assert "group-sync" not in REGISTRY
+
+
+def test_extension_management_actions_have_the_right_policy_shape() -> None:
+    """`extension-list`/`extension-get`/`extension-reload`/`extension-search`/`extension-enable`
+    are read-only, self-only, or low-risk-reversible — never approval-gated (KπX directive for
+    `extension-enable` specifically); `extension-disable` alone stays approval-gated, matching the
+    real risk of silently turning off a security-relevant extension the user still trusts."""
+    for name in ("extension-list", "extension-get", "extension-reload", "extension-search"):
+        assert REGISTRY[name].policy.approval is False, name
+    assert REGISTRY["extension-enable"].policy.approval is False
+    assert REGISTRY["extension-enable"].policy.preflight_fields == ("ids",)
+    assert REGISTRY["extension-disable"].policy.approval is True
+    assert REGISTRY["extension-disable"].policy.preflight_fields == ("ids",)
+
+
+def test_extension_uninstall_is_deliberately_not_implemented() -> None:
+    """`chrome.management.uninstall()` targeting another extension requires a genuine synchronous
+    DOM user gesture (live-verified, direct `Runtime.evaluate` on the paired extension's own
+    service worker) — a WebSocket-message-triggered call can never satisfy that, for any
+    extension-mediated architecture. No `extension-uninstall` action exists; see CONTRACT.md."""
+    assert "extension-uninstall" not in REGISTRY
 
 
 def test_bookmark_get_and_list_root_id_are_read_only_thin_extension_passthroughs() -> None:
@@ -449,7 +476,7 @@ def test_correlate_cdp_targets_sets_none_when_nothing_matches() -> None:
 def test_tab_update_and_group_add_tabs_are_registered_without_approval() -> None:
     """`tab-update`/`group-add-tabs` follow the same no-approval rationale as
     `window-create`/`tab-create`: directly observable, already-visible manipulations. Unlike
-    `group-remove-tabs` and `group-sync`, both now HITL-gated (KπX directive, GRAVÉ reversal)."""
+    `group-remove-tabs`, now HITL-gated (KπX directive, GRAVÉ reversal)."""
     for name, identity_field in (
         ("tab-update", "tab_id"),
         ("group-add-tabs", "group_id"),
@@ -459,11 +486,22 @@ def test_tab_update_and_group_add_tabs_are_registered_without_approval() -> None
         assert policy.preflight_fields == (identity_field,), name
 
 
-def test_group_remove_tabs_and_group_sync_are_now_approval_gated() -> None:
-    """Reversal from the original "directly observable" stance (KπX directive, GRAVÉ): both are
-    now treated as deliberate, reviewable reorganizations, same as `group-create`/`group-update`."""
-    for name in ("group-remove-tabs", "group-sync"):
-        assert REGISTRY[name].policy.approval is True, name
+def test_group_remove_tabs_is_now_approval_gated() -> None:
+    """Reversal from the original "directly observable" stance (KπX directive, GRAVÉ): treated as
+    a deliberate, reviewable reorganization, same as `group-create`/`group-update`."""
+    assert REGISTRY["group-remove-tabs"].policy.approval is True
+
+
+def test_window_sync_absorbs_the_purged_group_sync_action() -> None:
+    """`group-sync` was purged (KπX, GRAVÉ: "purge group-sync vu que inclus ds window-sync") since
+    `window-sync` without `bounds`/`state`/`focused` reorganizes the SAME `layout` schema — a
+    strict superset, never a second differently-shaped way to say the same thing. The underlying
+    bridge kind `group.sync` still exists (called internally by `window-sync`), but is no longer a
+    standalone public `do` action."""
+    assert "group-sync" not in REGISTRY
+    policy = REGISTRY["window-sync"].policy
+    assert policy.approval is True
+    assert policy.preflight_fields == ("profile", "window_id")
 
 
 def test_tab_update_forwards_to_the_extension_with_the_real_tab_id(monkeypatch, tmp_path) -> None:
@@ -903,21 +941,29 @@ def test_page_evaluate_runs_read_only_without_approval(monkeypatch, tmp_path) ->
 
 
 def test_page_click_resolves_box_then_dispatches_mouse_events(monkeypatch, tmp_path) -> None:
-    """``page-click`` resolves an element's box then dispatches a full mouse click sequence."""
-    calls: list[list[tuple[str, dict[str, Any]]]] = []
+    """``page-click`` resolves an element's box (via ONE bundled `page_session` call — never 3
+    separate ones, the exact bug root-caused live: `DOM.getDocument`'s `nodeId`s do not survive a
+    separate `page_session()` attach/detach cycle) then dispatches a full mouse click sequence."""
+    calls: list[list[tuple[str, Any]]] = []
 
     async def page_session(
-        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, Any]]
     ) -> list[dict[str, Any]]:
         calls.append(session_calls)
-        method = session_calls[0][0]
-        if method == "DOM.getDocument":
-            return [{"root": {"nodeId": 1}}]
-        if method == "DOM.querySelector":
-            return [{"nodeId": 7}]
-        if method == "DOM.getBoxModel":
-            return [{"model": {"content": [0, 0, 10, 0, 10, 10, 0, 10]}}]
-        return [{} for _ in session_calls]
+        results: list[dict[str, Any]] = []
+        for method, raw_params in session_calls:
+            params = raw_params(results) if callable(raw_params) else raw_params
+            if method == "DOM.getDocument":
+                results.append({"root": {"nodeId": 1}})
+            elif method == "DOM.querySelector":
+                assert params == {"nodeId": 1, "selector": "#submit"}
+                results.append({"nodeId": 7})
+            elif method == "DOM.getBoxModel":
+                assert params == {"nodeId": 7}
+                results.append({"model": {"content": [0, 0, 10, 0, 10, 10, 0, 10]}})
+            else:
+                results.append({})
+        return results
 
     monkeypatch.setattr(CdpBrowser, "page_session", page_session)
     daemon = _daemon_with_profile(tmp_path, monkeypatch)
@@ -948,12 +994,15 @@ def test_page_click_resolves_box_then_dispatches_mouse_events(monkeypatch, tmp_p
         "y": 5.0,
         "clicked": True,
     }
-    assert [batch[0][0] for batch in calls[:3]] == [
+    # Exactly TWO page_session calls total: one bundled DOM-resolution session (never split
+    # across 3 separate attach/detach cycles), then one bundled mouse-event session.
+    assert len(calls) == 2
+    assert [method for method, _ in calls[0]] == [
         "DOM.getDocument",
         "DOM.querySelector",
         "DOM.getBoxModel",
     ]
-    mouse_methods = [method for method, _ in calls[3]]
+    mouse_methods = [method for method, _ in calls[1]]
     assert mouse_methods == ["Input.dispatchMouseEvent"] * 3
 
 

@@ -9,12 +9,22 @@ Examples:
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 from urllib.request import urlopen
 
 from websockets.asyncio.client import connect
+
+CdpParams = dict[str, Any] | Callable[[list[dict[str, Any]]], dict[str, Any]]
+"""One call's CDP params in a `page_session()` chain — either a plain, precomputed dict, or a
+callable receiving the LIST of every earlier result in the SAME session so far and returning the
+real params dict. Needed whenever a later call's params depend on an earlier call's result (e.g.
+`DOM.querySelector`'s `nodeId` root, or `DOM.getBoxModel`'s target `nodeId`) — resolving such a
+chain across SEPARATE `page_session()` invocations is unsafe: each invocation attaches then
+detaches a brand-new CDP session, and DOM-domain `nodeId`s are scoped to the specific session that
+minted them (root-caused live, KπX, GRAVÉ: `DOM.getBoxModel` on a `nodeId` obtained from an already
+DETACHED session deterministically fails with `Could not find node with given id`)."""
 
 
 READ_ONLY_METHODS = frozenset(
@@ -25,9 +35,17 @@ READ_ONLY_METHODS = frozenset(
         "Browser.getWindowForTarget",
         "Browser.getWindowBounds",
         "Page.getNavigationHistory",
-        "Runtime.evaluate",
     }
 )
+"""Conservative allowlist consulted ONLY by `raw`'s dynamic approval check (`daemon.dispatch()`).
+`"Runtime.evaluate"` was REMOVED (KπX, GRAVÉ: live-verified dead entry) — `CdpBrowser.call()` (what
+`raw` actually uses) connects to the flat BROWSER-LEVEL CDP endpoint only, never attaching a
+per-page session; `Runtime.evaluate` (like every other Page/DOM/Input/Runtime domain method)
+requires a `sessionId` from `Target.attachToTarget` and simply does not exist at that level —
+confirmed live: `raw {"method":"Runtime.evaluate", ...}` always fails with `CDP_ERROR: 'Runtime.
+evaluate' wasn't found`, approval-gated or not. Leaving it whitelisted here was never an actual
+security gap (the call could never succeed either way) — purely dead, misleading documentation of
+a capability `raw` never had."""
 
 
 def is_read_only_method(method: str) -> bool:
@@ -193,14 +211,21 @@ class CdpBrowser:
             await self.call("Target.detachFromTarget", {"sessionId": session_id})
 
     async def page_session(
-        self, target_id: str, calls: list[tuple[str, dict[str, Any]]]
+        self, target_id: str, calls: Sequence[tuple[str, CdpParams]]
     ) -> list[dict[str, Any]]:
-        """Purpose: run several page-scoped CDP calls within one attached flattened session.
+        """Purpose: run several page-scoped CDP calls within ONE attached flattened session.
 
         Args:
             self (CdpBrowser): Client bound to one managed Edge debugging port.
             target_id (str): CDP page target receiving every call in this session.
-            calls (list[tuple[str, dict[str, Any]]]): Ordered ``(method, params)`` pairs.
+            calls (Sequence[tuple[str, CdpParams]]): Ordered ``(method, params)`` pairs — ``params`` is
+                either a plain dict, or a callable receiving the list of every EARLIER result in
+                this SAME session so far (see ``CdpParams``) and returning the real params dict.
+                Use the callable form whenever a call's params depend on an earlier call's result
+                within the SAME chain (e.g. resolving a CSS selector to a `nodeId` then using that
+                `nodeId` in a later `DOM.*` call) — splitting such a chain across separate
+                `page_session()` invocations is a real, confirmed bug (each invocation attaches a
+                brand-new session; DOM-domain `nodeId`s do not survive a detach/reattach).
 
         Returns:
             list[dict[str, Any]]: Result objects in the same order as ``calls``.
@@ -234,7 +259,8 @@ class CdpBrowser:
                 raise RuntimeError("CDP_ERROR: attach did not return sessionId")
             results: list[dict[str, Any]] = []
             try:
-                for method, params in calls:
+                for method, raw_params in calls:
+                    resolved_params = raw_params(results) if callable(raw_params) else raw_params
                     self._next_id += 1
                     call_id = self._next_id
                     await websocket.send(
@@ -243,7 +269,7 @@ class CdpBrowser:
                                 "id": call_id,
                                 "sessionId": session_id,
                                 "method": method,
-                                "params": params,
+                                "params": resolved_params,
                             }
                         )
                     )

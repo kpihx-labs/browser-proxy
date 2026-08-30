@@ -57,13 +57,6 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
     "group-move": {"profile": "default", "group_id": 1, "window_id": 2},
     "group-add-tabs": {"profile": "default", "group_id": 1, "tab_ids": [3, 4]},
     "group-remove-tabs": {"profile": "default", "tab_ids": [3, 4]},
-    "group-sync": {
-        "profile": "default",
-        "layout": [
-            {"type": "tab", "tab_id": 1},
-            {"type": "group", "title": "Research", "tab_ids": [2, 3]},
-        ],
-    },
     "bookmark-list": {"profile": "default", "depth": 1},
     "bookmark-get": {"profile": "default", "id": "42"},
     "bookmark-create": {
@@ -83,6 +76,12 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "profile": "default",
         "items": [{"id": "42", "title": "Renamed", "parent_id": "1"}],
     },
+    "extension-list": {"profile": "default"},
+    "extension-get": {"profile": "default", "id": "<extension-id>"},
+    "extension-enable": {"profile": "default", "ids": ["<extension-id>"]},
+    "extension-disable": {"profile": "default", "ids": ["<extension-id>"]},
+    "extension-reload": {"profile": "default"},
+    "extension-search": {"profile": "default", "store": "edge", "query": "dark reader"},
     "page-navigate": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -126,7 +125,6 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
     "page-console-list": {"profile": "default", "target_id": "<target-id>"},
     "page-network-list": {"profile": "default", "target_id": "<target-id>"},
     "page-dialog-policy": {"profile": "default", "target_id": "<target-id>", "action": "dismiss"},
-    "page-set-download-behavior": {"profile": "default", "path": "/tmp/browser-proxy-downloads"},
     "cookie-list": {"profile": "default"},
     "cookie-set": {"profile": "default", "name": "theme", "value": "dark", "domain": "example.com"},
     "cookie-remove": {"profile": "default", "name": "theme", "domain": "example.com"},
@@ -275,6 +273,7 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
         "profile": "default",
         "target_id": "<target-id>",
         "url": "https://example.com",
+        "ready_state": "complete",
         "tab_id": 12,
         "window_id": 143985019,
         "group_id": 1,
@@ -304,12 +303,6 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
     "group-move": {"group_id": 1, "window_id": 2},
     "group-add-tabs": {"group_id": 1, "tab_ids": [3, 4]},
     "group-remove-tabs": {"tab_ids": [3, 4], "ungrouped": True},
-    "group-sync": {
-        "layout": [
-            {"type": "tab", "tab_id": 1},
-            {"type": "group", "group_id": 2, "tab_ids": [2, 3]},
-        ]
-    },
     "bookmark-list": {
         "depth": 1,
         "roots": [
@@ -383,6 +376,85 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
             }
         ]
     },
+    "extension-list": {
+        "extensions": [
+            {
+                "id": "<extension-id>",
+                "name": "Browser Proxy Bridge for Microsoft Edge",
+                "short_name": "Browser Proxy Bridge",
+                "version": "0.2.0",
+                "description": "A local, approval-gated bridge between Microsoft Edge and browser-proxyd.",
+                "type": "extension",
+                "enabled": True,
+                "may_disable": True,
+                "install_type": "development",
+                "offline_enabled": False,
+                "homepage_url": None,
+                "update_url": None,
+                "options_url": "chrome-extension://<extension-id>/options.html",
+                "permissions": [
+                    "bookmarks",
+                    "tabs",
+                    "tabGroups",
+                    "storage",
+                    "alarms",
+                    "management",
+                ],
+                "host_permissions": [],
+                "permission_warnings": [
+                    "Read and change your bookmarks",
+                    "Manage your apps, extensions, and themes",
+                ],
+                "icons": [],
+            }
+        ]
+    },
+    "extension-get": {
+        "id": "<extension-id>",
+        "name": "Browser Proxy Bridge for Microsoft Edge",
+        "short_name": "Browser Proxy Bridge",
+        "version": "0.2.0",
+        "description": "A local, approval-gated bridge between Microsoft Edge and browser-proxyd.",
+        "type": "extension",
+        "enabled": True,
+        "may_disable": True,
+        "install_type": "development",
+        "offline_enabled": False,
+        "homepage_url": None,
+        "update_url": None,
+        "options_url": "chrome-extension://<extension-id>/options.html",
+        "permissions": ["bookmarks", "tabs", "tabGroups", "storage", "alarms", "management"],
+        "host_permissions": [],
+        "permission_warnings": [
+            "Read and change your bookmarks",
+            "Manage your apps, extensions, and themes",
+        ],
+        "icons": [],
+    },
+    "extension-enable": {
+        "updated": [{"id": "<extension-id>", "name": "Some Extension", "enabled": True}]
+    },
+    "extension-disable": {
+        "updated": [{"id": "<extension-id>", "name": "Some Extension", "enabled": False}]
+    },
+    "extension-reload": {
+        "reloading": True,
+        "id": "<extension-id>",
+        "name": "Browser Proxy Bridge for Microsoft Edge",
+        "version": "0.2.0",
+    },
+    "extension-search": {
+        "profile": "default",
+        "store": "edge",
+        "query": "dark reader",
+        "results": [
+            {
+                "id": "ifoakfbpdcdoeenechcleahebpibofpc",
+                "slug": "dark-reader",
+                "text_block": ["Dark Reader", "Extension", "(1.4K) · alexanderby", "Get"],
+            }
+        ],
+    },
     "page-navigate": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -435,11 +507,6 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
     "page-console-list": {"profile": "default", "target_id": "<target-id>", "messages": []},
     "page-network-list": {"profile": "default", "target_id": "<target-id>", "requests": []},
     "page-dialog-policy": {"profile": "default", "target_id": "<target-id>", "policy": "dismiss"},
-    "page-set-download-behavior": {
-        "profile": "default",
-        "path": "/tmp/browser-proxy-downloads",
-        "configured": True,
-    },
     "cookie-list": {"profile": "default", "cookies": []},
     "cookie-set": {"profile": "default", "name": "theme", "domain": "example.com", "set": True},
     "cookie-remove": {
@@ -535,6 +602,9 @@ FIELD_NOTES: dict[str, str] = {
         "instead of the top-level roots; `depth` then counts from THAT folder."
     ),
     "items": "Ordered batch list of per-item objects — several created/updated in ONE call.",
+    "store": '`"edge"` (Microsoft Edge Add-ons) or `"chrome"` (Chrome Web Store — Edge can install from both).',
+    "query": "Free-text search query, exactly as typed into the store's own search box.",
+    "limit": "Maximum number of search results returned. Defaults to `20`.",
 }
 
 OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
@@ -548,7 +618,15 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "page-dialog-policy": ("prompt_text",),
     "cookie-set": ("path", "secure", "http_only"),
     "storage-local-get": ("key",),
-    "tab-create": ("new_window", "window_id", "group_id", "index", "before_tab_id", "after_tab_id"),
+    "tab-create": (
+        "new_window",
+        "window_id",
+        "group_id",
+        "index",
+        "before_tab_id",
+        "after_tab_id",
+        "wait_seconds",
+    ),
     "tab-update": ("url", "window_id", "group_id", "index", "before_tab_id", "after_tab_id"),
     "window-sync": ("bounds", "state", "focused", "layout"),
     "group-create": ("color",),
@@ -558,6 +636,7 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "browser-drop-file": ("mime_type",),
     "browser-get-new-tab": ("timeout_seconds",),
     "bookmark-list": ("depth", "root_id"),
+    "extension-search": ("limit",),
 }
 
 ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
@@ -605,6 +684,12 @@ ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
         "call per item."
     ),
     ("bookmark-get", "id"): "Real bookmark or folder id to read ALL available information about.",
+    (
+        "extension-get",
+        "id",
+    ): "Real chrome.management extension id to read ALL available detail about.",
+    ("extension-enable", "ids"): "Non-empty list of real extension ids to enable in ONE call.",
+    ("extension-disable", "ids"): "Non-empty list of real extension ids to disable in ONE call.",
 }
 
 

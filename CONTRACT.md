@@ -19,10 +19,12 @@
 > real tabs, each tab's real title/url — never opaque ids alone), with a single configurable timeout
 > (`config.HITL_TIMEOUT_SECONDS_DEFAULT`, `BROWSER_PROXY_HITL_TIMEOUT_SECONDS`) shared by the daemon
 > and the extension so neither can give up before the other (KπX directive: 100% transparency,
-> "human readable... intuitif"; see `## HITL transparency and redirection`). `do group-sync`/
-> `do window-sync` (new) reorganize a whole window's tab/group layout — create, rename, recolor,
-> add-to, remove-from, and reposition — in ONE call, now BOTH `@require_approval`-gated (KπX
-> directive, GRAVÉ reversal: absolute flexibility, but reviewable).
+> "human readable... intuitif"; see `## HITL transparency and redirection`). `do window-sync`
+> reorganizes a whole window's tab/group layout — create, rename, recolor, add-to, remove-from,
+> and reposition — in ONE call, `@require_approval`-gated (KπX directive, GRAVÉ reversal: absolute
+> flexibility, but reviewable). The standalone `do group-sync` was purged (KπX, GRAVÉ: "purge
+> group-sync vu que inclus ds window-sync") since `window-sync` without `bounds`/`state`/`focused`
+> is a strict superset of what it did.
 
 ---
 
@@ -98,7 +100,7 @@ browser-proxy admin <command>                                              # lif
 | `window-list` | `Target.getTargets` (filtered to `type=="page"`, via shared `_page_targets()`) then ONE `Browser.getWindowForTarget` per tab, grouped by the real returned `windowId`; plus, when the extension is connected, bridge kind `window.layout` merged in as `chrome_layout` | ❌ | Returns `{"windows": [{"window_id", "bounds", "tabs": [...], "chrome_layout": {...}|null}]}` — never a flat target list (see `## Window grouping` and `## Canonical tab/group structure`); `tab-list` reuses this SAME computation by flattening it, independent of `window-list`'s own grouped shape |
 | `window-create` | `Target.createTarget` (`newWindow: true`), then `Browser.getWindowForTarget` for the real `window_id`, then (optional) `layout` — see `## Window layout` | ❌ preflight `profile` + verify `url` | Deliberately NOT approval-gated — every managed Edge window is already always real and visible (never headless), so opening one is directly observable the instant it happens; no hidden side effect for an overlay to meaningfully gate |
 | `window-close` | `Target.closeTarget` (one call per `target_id`, all in ONE approval) | ✅ preflight `profile`,`target_ids` | `target_ids` is a LIST — closing several tabs/windows across the profile is ONE deliberate command with ONE approval, never N separate calls each needing its own round-trip (root-caused, KπX: too slow/tedious in practice) |
-| `window-sync` | bridge kind `window.update` (bounds/state/focused) and/or bridge kind `group.sync` (layout) — see `## Window layout` | ✅ preflight `profile`,`window_id` | The window-level equivalent of `group-sync` (KπX: "très complet et flexible"): adjust an EXISTING window's own bounds/state/focus AND/OR reorganize its whole tab/group `layout`, all in one call, one approval |
+| `window-sync` | bridge kind `window.update` (bounds/state/focused) and/or bridge kind `group.sync` (layout, called internally — no longer a standalone public action) — see `## Window layout` | ✅ preflight `profile`,`window_id` | "très complet et flexible" (KπX): adjust an EXISTING window's own bounds/state/focus AND/OR reorganize its whole tab/group `layout`, all in one call, one approval. Without `bounds`/`state`/`focused`, this is a strict superset of the purged `group-sync` (see `## Groups`) |
 
 ### Window grouping — `window-list` reports real windows, not a flat target list
 
@@ -195,14 +197,17 @@ their REAL `chrome_tab_id` — never a CDP `target_id`, which `chrome.tabs.*` ca
 | `tab-update` | bridge kind `tab.update` — `chrome.tabs.update` (url), `chrome.tabs.group`/`ungroup` (group_id), `chrome.tabs.move` (position/window), applied in that fixed order | ❌ preflight `tab_id` | Renamed from `tab-move` (KπX, GRAVÉ: "renomme en tab-update... url, window, folder, index... centralise vraiment tout cela pour redistribuer partout cette philo de fin ajustement"). ANY combination of `url`, `window_id`, `group_id` (`null` removes from group), and AT MOST ONE of `index`/`before_tab_id`/`after_tab_id` — at least one field beyond `tab_id` required, never a silent no-op |
 | `group-add-tabs` | `chrome.tabs.group({tabIds, groupId})` | ❌ preflight `group_id` | Adds tabs to an ALREADY-CREATED group — never creates a new one (that's `group-create`) |
 | `group-remove-tabs` | `chrome.tabs.ungroup` | ✅ preflight `tab_ids` | Removes tabs from their group WITHOUT closing them |
-| `group-sync` | `chrome.tabs.group`/`ungroup`/`move` + `chrome.tabGroups.update`/`move` in one pass — see `## HITL transparency and redirection` | ✅ preflight `layout` | Reorganizes a WHOLE window's layout (`{"layout": [...]}}`) in ONE call — create, rename, recolor, add-to, remove-from, and reposition, all at once |
 
 `tab-update`/`group-add-tabs` stay **NOT** `@require_approval`-gated — repositioning/regrouping an
 already-visible tab is directly observable the instant it happens, the same rationale already
-applied to `window-create`/`tab-create`. `group-remove-tabs` and `group-sync` are now **gated**
-(KπX directive, GRAVÉ — a reversal of their original "directly observable" stance), same treatment
-as `group-create`/`group-update`/`group-move`/`window-sync`: reorganizing a whole window/group's
-structure is now always a deliberate, reviewable command.
+applied to `window-create`/`tab-create`. `group-remove-tabs` is now **gated** (KπX directive, GRAVÉ
+— a reversal of its original "directly observable" stance), same treatment as `group-create`/
+`group-update`/`group-move`/`window-sync`: reorganizing a whole window/group's structure is now
+always a deliberate, reviewable command. The standalone `group-sync` action that used to reorganize
+a WHOLE window's layout (`chrome.tabs.group`/`ungroup`/`move` + `chrome.tabGroups.update`/`move` in
+one pass) was **purged** (KπX, GRAVÉ: "purge group-sync vu que inclus ds window-sync") — its exact
+`layout` schema and the same underlying bridge kind (`group.sync`) are now reached exclusively
+through `window-sync`, which is a strict superset whenever `bounds`/`state`/`focused` are omitted.
 
 ### Window layout — build/reorganize a whole tab/group setup in one `layout` field
 
@@ -239,7 +244,7 @@ one.
 |---|---|---|---|
 | `tab-list` | reuses `window-list`'s FULL computation, flattened per tab — see `## Window grouping` | ❌ | Each tab carries `window_id` and `group_id`/`group_title` (both `null` if ungrouped/extension unavailable) — root-caused live (KπX): a flat tab list with zero window/folder context gave no way to recognize which tab is which |
 | `tab-get` | same flattened view (matched by `target_id`) merged with raw `Target.getTargetInfo` | ❌ | Replaces `page-get` (KπX, GRAVÉ: "tab = page... je ne veux pas de duplication inutile" — `page-get` was a second, narrower "get one tab's identity" action with zero window/group context; merged here as the single comprehensive source). Fails closed (`CDP_UNAVAILABLE`) for an unknown `target_id` |
-| `tab-create` | `Target.createTarget` (optionally `windowId`/`newWindow`), then (only if `group_id`/position requested) bridge kind `tab.update` to place the captured real chrome tab id | ❌ preflight `profile` + verify `url` | As fine-grained as possible (KπX, GRAVÉ: "on doit être le plus fin possible... donner l'illusion d'un aspect esthétique visuel, pas juste créer du bullshit"): optional `window_id` (open in an EXISTING window — mutually exclusive with `new_window`), optional `group_id` (add to an EXISTING group the instant it's created), optional `index`/`before_tab_id`/`after_tab_id`. Deliberately NOT approval-gated, same rationale as `window-create` |
+| `tab-create` | `Target.createTarget` (optionally `windowId`/`newWindow`), then (only if `group_id`/position requested) bridge kind `tab.update` to place the captured real chrome tab id, then polls `document.readyState` on the new tab itself | ❌ preflight `profile` + verify `url` | As fine-grained as possible (KπX, GRAVÉ: "on doit être le plus fin possible... donner l'illusion d'un aspect esthétique visuel, pas juste créer du bullshit"): optional `window_id` (open in an EXISTING window — mutually exclusive with `new_window`), optional `group_id` (add to an EXISTING group the instant it's created), optional `index`/`before_tab_id`/`after_tab_id`, optional `wait_seconds` (defaults to `10`, same convention as `page-navigate`/`page-reload`). Returns `ready_state` for the new tab's own initial load (KπX, GRAVÉ: "asymétrie corrigée" — used to return before confirming the new tab had even started rendering). Deliberately NOT approval-gated, same rationale as `window-create` |
 | `tab-activate` | `Target.activateTarget` | ❌ preflight `profile`,`target_id` | **No longer approval-gated** (KπX directive, GRAVÉ reversal): activating an already-open, already-visible tab is directly observable the instant it happens. Its role is purely navigational focus — bring a specific already-open tab to the front (e.g. before a screenshot/interaction, or to surface a background tab) — it never creates/closes/mutates content |
 | `tab-update` | bridge kind `tab.update` — see `## Moving and regrouping tabs` | ❌ preflight `tab_id` | Renamed from `tab-move`. Addresses the REAL `chrome_tab_id`, never a CDP `target_id` |
 
@@ -268,7 +273,10 @@ profiles → windows → tabs → tab groups.
 | `group-move` | bridge kind `group.move` | ✅ preflight `group_id` | |
 | `group-add-tabs` | bridge kind `group.add_tabs` — see `## Canonical tab/group structure` | ❌ preflight `group_id` | adds to an EXISTING group, never creates one |
 | `group-remove-tabs` | bridge kind `group.remove_tabs` — see `## Canonical tab/group structure` | ✅ preflight `tab_ids` | ungroups without closing — now gated (KπX directive, GRAVÉ reversal) |
-| `group-sync` | bridge kind `group.sync` — see `## Moving and regrouping tabs` | ✅ preflight `layout` | reorganizes a WHOLE window's tab/group structure in one call — now gated (KπX directive, GRAVÉ reversal) |
+
+No standalone `group-sync` action — purged (KπX, GRAVÉ: "purge group-sync vu que inclus ds
+window-sync"). The underlying bridge kind `group.sync` still exists, called internally by
+`window-sync` (see `## Windows`) — never publicly reachable as its own top-level `do` action.
 
 #### Bookmarks (extension-mediated) — filesystem-like tree, full batch flexibility
 
@@ -284,6 +292,55 @@ bookmarks/folders created, removed, or updated in ONE call, never one call per i
 | `bookmark-create` | bridge kind `bookmark.create` | ✅ preflight `items` | batch: `items` is an ORDERED list of `{"type":"folder"\|"bookmark","title","url"? (bookmark only),"parent_id"? (existing real folder),"parent_ref"? (an EARLIER folder item's local `ref` in the SAME batch — mutually exclusive with `parent_id`),"ref"? (a local name later items may target),"index"?}`; a folder created earlier in the batch can be filled immediately via `parent_ref`, zero extra round trip. Not atomic (documented) — a failure partway leaves earlier creations in place |
 | `bookmark-remove` | bridge kind `bookmark.remove` | ✅ preflight `ids` | batch: `ids` is a non-empty list mixing folder AND leaf bookmark identifiers freely in the SAME call — a folder id is removed WITH its whole subtree (`chrome.bookmarks.removeTree`), a leaf id alone (`chrome.bookmarks.remove`). Every id is resolved BEFORE any removal happens — an unknown id anywhere in the batch removes NOTHING (all-or-nothing identity) |
 | `bookmark-update` | bridge kind `bookmark.update` | ✅ preflight `items` | batch, fine-grained: `items` is a list of `{"id","title"?,"url"? (bookmark only),"parent_id"?,"index"?}` — any subset of rename/re-url/relocate/reposition per item, at least one field beyond `id` required (a no-op item is rejected). Every id is resolved BEFORE any mutation happens — an unknown id, or a `url` given for an id that is actually a folder, rejects the WHOLE call |
+
+#### Extensions (extension-mediated, `chrome.management` — permission `management`)
+
+Manages the WHOLE installed extension ecosystem in this Edge profile — not just this daemon's own
+paired extension. `extension-list`/`extension-get`/`extension-enable` are read-only or low-risk,
+never approval-gated; `extension-disable` alone is batch and approval-gated (can silently turn off
+a security-relevant extension); `extension-reload` restarts THIS SAME extension only, un-gated (no
+user data at risk); `extension-search` is a separate, non-extension-mediated action (direct CDP, no
+bridge round trip) that reads a real public store search page.
+
+| Action | Backend | Approval | Notes |
+|---|---|---|---|
+| `extension-list` | bridge kind `extension.list`, `chrome.management.getAll()` + `getPermissionWarningsById()` per entry | ❌ | full `ExtensionInfo` detail for EVERY installed extension/app/theme, including this one, PLUS human-readable `permission_warnings` next to the raw `permissions`/`host_permissions` — never permission strings alone |
+| `extension-get` | bridge kind `extension.get` | ❌ | same full detail, scoped to one real id |
+| `extension-enable` | bridge kind `extension.enable`, `chrome.management.setEnabled(id,true)` | ❌ preflight `ids` | batch: non-empty `ids`, several enabled in ONE call; deliberately NOT approval-gated (KπX directive) — low-risk, reversible; refuses to target this same extension's own id (points at `extension-reload` instead) |
+| `extension-disable` | bridge kind `extension.disable`, `setEnabled(id,false)` | ✅ preflight `ids` | same batch/self-guard rules as `extension-enable`, but KEEPS its approval gate — can silently turn off a security-relevant extension the user still trusts |
+| `extension-reload` | bridge kind `extension.reload`, `chrome.runtime.reload()` | ❌ | restarts ONLY the paired extension's own service worker — "répondre avant de couper": the daemon's response is sent, THEN the reload is scheduled 200ms later (a full JS macrotask after `send()` already ran), so the daemon never sees a dropped connection before its answer. Not extension-mediated in the usual mutation sense — genuinely safe, no approval needed |
+| `extension-search` | **NOT** extension-mediated — direct CDP: a temporary tab is created (`Target.createTarget`), navigated to a REAL public search results page (`microsoftedge.microsoft.com/addons/search/<query>` or `chromewebstore.google.com/search/<query>`), scraped via `Runtime.evaluate`, then closed (`Target.closeTarget`) | ❌ | `{store:"edge"\|"chrome", query, limit?}` → `{results:[{id,slug,text_block}]}`. **NOT an official API** — neither Microsoft nor Google publishes a search endpoint; this reads the exact page a human would see, same primitives as `page-navigate`/`page-evaluate`. Chrome Web Store shows Google's own consent interstitial first — dismissed automatically (`Reject all`) before scraping. Best-effort extraction: only the `/detail/<slug>/<32-char-id>` link pattern is structurally stable; `text_block` is raw nearby text, not guaranteed per-field-mapped. A future markup change on either store's side can silently break this action — no contract, no version pin, no notice |
+
+##### `extension-uninstall` — deliberately NOT implemented (Chrome platform restriction, live-verified)
+
+No `extension-uninstall` action exists. Live-verified root cause (direct `Runtime.evaluate` on the
+paired extension's own service worker): `chrome.management.uninstall()` targeting ANOTHER
+extension rejects unconditionally with `"chrome.management.uninstall requires a user gesture."` —
+Chrome/Edge require this call to originate from a genuine, synchronous DOM click event in the
+SAME call stack. Every daemon-mediated mutation reaches `background.ts` via a WebSocket message
+(`onmessage` → `handleRequest()`), never a direct DOM event — even though a real human click DID
+happen moments earlier in this daemon's OWN HITL approval overlay, that gesture cannot cross the
+content-script → background-script message boundary. This is not a timing bug and not fixable by
+retrying, reordering, or reducing latency: NO extension-mediated architecture can ever satisfy this
+requirement for uninstalling an extension OTHER than itself. (`chrome.management.setEnabled` has no
+such restriction — confirmed working live — which is why `extension-enable`/`disable` remain.)
+Uninstalling an extension requires a real, direct click in `edge://extensions/` — automatable only
+as far as opening that page (`page-navigate`), never the click itself.
+
+##### Installing via `extension-search` — a native Edge permission popup may still require KπX's own click
+
+`extension-search` finds a real extension; installing it is `page-navigate` to its store detail
+page + `page-click` (or a JS-driven click) on the real "Get" button — both already-existing generic
+primitives, no dedicated `do` action. What happens next depends on the target extension's OWN
+requested permissions: an extension declaring little/no permissions beyond `activeTab`/`storage`
+(live-verified: GoFullPage — Full Page Screen Capture) installs directly, no further prompt at all.
+An extension requesting broader permissions (host permissions, `<all_urls>`, etc.) makes Edge show
+its OWN native "Add extension?" permission-review popup — a genuine OS/browser-chrome UI element
+outside any page's DOM, entirely outside CDP's reach (same user-gesture-only restriction as
+`chrome.management.uninstall` above). **KπX must personally click that popup when it appears** —
+there is no way to detect, wait for, or dismiss it programmatically; a caller should always expect
+this possibility and ask KπX to confirm the real, final `extension-list`/`extension-get` state
+afterward rather than assuming the click from `page-click` alone was sufficient.
 
 #### Navigation
 
@@ -322,12 +379,6 @@ bookmarks/folders created, removed, or updated in ONE call, never one call per i
 |---|---|---|---|
 | `page-dialog-policy` | `Runtime.evaluate` — overrides `window.alert/confirm/prompt` to auto-resolve | ❌ | does not survive a future full navigation (no `Page.addScriptToEvaluateOnNewDocument` persistent session) |
 
-#### Downloads
-
-| Action | Backend | Approval | Notes |
-|---|---|---|---|
-| `page-set-download-behavior` | `Browser.setDownloadBehavior` (browser-level, no `target_id`) | ❌ | creates the local directory first |
-
 #### Cookies (browser-level, no `target_id`)
 
 | Action | Backend | Approval | Notes |
@@ -359,7 +410,17 @@ bookmarks/folders created, removed, or updated in ONE call, never one call per i
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `raw` | any browser-level CDP `method`+`params`, verbatim | dynamic: `is_read_only_method()` allowlist (`Browser.getVersion`, `Target.getTargets`, `Target.getTargetInfo`, `Browser.getWindowForTarget`, `Browser.getWindowBounds`, `Page.getNavigationHistory`, `Runtime.evaluate`) bypasses approval; every other method is fail-closed extension-approved | escape hatch for anything not yet a first-class action |
+| `raw` | any BROWSER-LEVEL CDP `method`+`params`, verbatim (`CdpBrowser.call()` — flat WebSocket, NEVER `Target.attachToTarget`) | dynamic: `is_read_only_method()` allowlist (`Browser.getVersion`, `Target.getTargets`, `Target.getTargetInfo`, `Browser.getWindowForTarget`, `Browser.getWindowBounds`, `Page.getNavigationHistory`) bypasses approval; every other method is fail-closed extension-approved | escape hatch for anything not yet a first-class action — but ONLY for browser-level CDP domains |
+
+**`raw` cannot reach page-level CDP domains — live-verified, not a theoretical limit.** `raw`'s
+backend (`CdpBrowser.call()`) connects directly to the browser-level CDP endpoint and never
+attaches a per-page session (`Target.attachToTarget`, which yields the `sessionId` every
+`Runtime.*`/`DOM.*`/`Input.*`/`Page.*` method requires to route to a specific renderer). Confirmed
+live: `raw {"method":"Runtime.evaluate","params":{"expression":"1+1"}}` fails unconditionally with
+`CDP_ERROR: 'Runtime.evaluate' wasn't found` — the method simply does not exist at that level, no
+matter the params or approval state. For anything page-scoped, use the dedicated `page-*` actions
+(they call `CdpBrowser.page_session()` instead, which DOES attach). `Runtime.evaluate` used to sit
+in `is_read_only_method()`'s allowlist despite this — purged as dead/misleading (see `cdp.py`).
 
 ---
 
@@ -697,20 +758,21 @@ under the setTimeout's own 60s deadline — because the worker died first). `chr
 survives eviction — Chromium redelivers it by waking the worker, the same pattern already used for
 the reconnect watchdog (see `## Extension bridge identity`).
 
-**`do group-sync` — reorganize a WHOLE window in ONE call, absolute flexibility (KπX directive):**
-bridge kind `group.sync`, payload `{"layout": [...]}}` — an ORDERED list processed left to right,
-each entry either `{"type":"tab","tab_id":N}` (a standalone ungrouped tab at this position) or
+**`window-sync`'s `layout` — reorganize a WHOLE window in ONE call, absolute flexibility (KπX
+directive):** bridge kind `group.sync` (called internally — never a standalone `do` action anymore,
+see `## Groups`), payload `{"layout": [...]}}` — an ORDERED list processed left to right, each entry
+either `{"type":"tab","tab_id":N}` (a standalone ungrouped tab at this position) or
 `{"type":"group","group_id":N|omitted,"title":str,"color":str,"tab_ids":[N,...]}` (a whole group at
 this position — `group_id` given reuses/renames/recolors/adds-to that EXACT existing group;
 omitted creates a brand-new one). One command creates, renames, recolors, adds-to, removes-from,
 AND repositions, all at once — never N separately-approved primitive calls for what is
-conceptually one deliberate rearrangement. **Now `@require_approval`** (KπX directive, GRAVÉ — a
-reversal from its original "directly observable" stance, same as `group-remove-tabs`): its HITL
-overlay resolves every real tab id referenced ANYWHERE inside `layout` via `describeNativeReferences`
-(nested-entry-aware, shared with `window-sync`'s own `layout` field — one illustration path, never
-duplicated per action). `tab-update`/`group-add-tabs` remain the two exceptions that stay
-approval-free — repositioning/regrouping an already-visible tab without changing a whole
-window/group's STRUCTURE is still directly observable, the line KπX drew between the two.
+conceptually one deliberate rearrangement. `@require_approval` (KπX directive, GRAVÉ — a reversal
+from its original "directly observable" stance, same as `group-remove-tabs`): its HITL overlay
+resolves every real tab id referenced ANYWHERE inside `layout` via `describeNativeReferences`
+(nested-entry-aware — one illustration path, never duplicated per action). `tab-update`/
+`group-add-tabs` remain the two exceptions that stay approval-free — repositioning/regrouping an
+already-visible tab without changing a whole window/group's STRUCTURE is still directly observable,
+the line KπX drew between the two.
 
 ---
 

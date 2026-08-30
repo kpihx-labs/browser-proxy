@@ -29,7 +29,7 @@ browser-proxy do group-list '{"profile":"default"}'
 browser-proxy do tab-move '{"profile":"default","tab_id":12,"after_tab_id":34}'
 browser-proxy do group-add-tabs '{"profile":"default","group_id":7,"tab_ids":[12,13]}'
 browser-proxy do group-remove-tabs '{"profile":"default","tab_ids":[12]}'
-browser-proxy do group-sync '{"profile":"default","layout":[
+browser-proxy do window-sync '{"profile":"default","window_id":143985332,"layout":[
   {"type":"tab","tab_id":1},
   {"type":"group","title":"Research","tab_ids":[2,3]},
   {"type":"tab","tab_id":4}
@@ -90,9 +90,9 @@ tab AND its window to the front first — never a prompt you have to discover by
 centralized tab resolution backs every HITL kind (approval, ask, dismiss-overlays, captcha, set
 date/combobox, drop-file), including automatic retry via a fresh temporary tab if the found one's
 content script turns out stale (e.g. right after the extension itself reloads) — that temporary tab
-is always closed again once the interaction settles, never left behind. `do group-sync` reorganizes
-a whole window's tab/group layout — create, rename, recolor, add-to, remove-from, reposition — in
-ONE call. See `CONTRACT.md` → HITL transparency and redirection.
+is always closed again once the interaction settles, never left behind. `do window-sync`'s `layout`
+reorganizes a whole window's tab/group layout — create, rename, recolor, add-to, remove-from,
+reposition — in ONE call. See `CONTRACT.md` → HITL transparency and redirection.
 
 The registry covers the full Edge profile hierarchy: profiles, heuristic Workspaces, windows,
 tab groups, tabs, pages, and profile bookmarks. `workspace-list` and `group-list` clearly label

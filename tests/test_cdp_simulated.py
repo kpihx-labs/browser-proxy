@@ -206,3 +206,40 @@ def test_page_session_uses_flattened_top_level_session_id(monkeypatch) -> None:
         "params": {"sessionId": "session-1"},
     }
     assert all("message" not in frame for frame in websocket.sent)
+
+
+def test_page_session_resolves_callable_params_from_earlier_results_in_the_same_session(
+    monkeypatch,
+) -> None:
+    """A later call's params may be a callable receiving every earlier result IN THIS SAME
+    session so far — the fix for a real, live-confirmed bug (KπX, GRAVÉ): resolving a chain (e.g.
+    `DOM.querySelector`'s `nodeId` root from a PRIOR `DOM.getDocument`) across separate
+    `page_session()` calls silently broke, since each call attaches then detaches a brand-new
+    session and DOM-domain `nodeId`s do not survive that. Bundling the whole chain into ONE
+    session, with later params resolved from earlier real results, is the fix — this proves the
+    resolution happens against the REAL prior result, over the REAL websocket layer."""
+    websocket = _SessionWebSocket()
+    monkeypatch.setattr("browser_proxy.cdp.urlopen", lambda *_args, **_kwargs: _HttpResponse())
+    monkeypatch.setattr("browser_proxy.cdp.connect", lambda _url: websocket)
+    seen_prior_step: list[str] = []
+
+    def resolve_from_prior(results: list[dict[str, Any]]) -> dict[str, Any]:
+        seen_prior_step.append(results[0]["step"])
+        return {"nodeId": results[0]["nodes"]}
+
+    results = asyncio.run(
+        CdpBrowser(9222).page_session(
+            "target-1",
+            [("Accessibility.enable", {}), ("Accessibility.getFullAXTree", resolve_from_prior)],
+        )
+    )
+
+    assert results == [{"nodes": [], "step": "enable"}, {"nodes": [1], "step": "tree"}]
+    # The callable really ran against the REAL first result — never a placeholder/empty list.
+    assert seen_prior_step == ["enable"]
+    assert websocket.sent[2] == {
+        "id": 3,
+        "sessionId": "session-1",
+        "method": "Accessibility.getFullAXTree",
+        "params": {"nodeId": []},
+    }

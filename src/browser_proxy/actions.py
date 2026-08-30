@@ -3,13 +3,14 @@
 import asyncio
 import base64
 import json
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from browser_proxy.cdp import CdpBrowser
+from browser_proxy.cdp import CdpBrowser, CdpParams
 from browser_proxy.doc import attach_public_docstrings
 from browser_proxy.paths import (
     edge_cdp_port,
@@ -223,19 +224,34 @@ async def _profile_remove(payload: dict[str, Any], context: DaemonContext) -> di
     return await context.remove_profile(name)
 
 
+_VISIBLE_TARGET_TYPES = frozenset({"page", "browser_ui"})
+"""`window-list`/`tab-list`/`tab-get`'s target-type net — root-caused live (KπX, GRAVÉ): closing
+every `type=="page"` tab in a window can leave Edge showing ONE surviving internal page
+(`edge://settings/profiles` observed live — an Edge Workspace window falling back to Settings once
+its last real content tab closed) whose CDP `type` is `"browser_ui"`, NOT `"page"`. The former
+`type=="page"`-only filter made that entire, still genuinely VISIBLE window silently disappear from
+every listing — a real "0 Trust · 100% Control" violation (real browser state hidden from KπX).
+Widening to `{"page","browser_ui"}` restores visibility; `_window_id_for_target`'s pre-existing
+`None`-bucket behavior (see its own docstring) already cleanly separates genuine windowed
+`browser_ui` tabs (Settings, New Tab) from ephemeral, window-less UI panels (`TabSearch`,
+`discover-chat-v2`) that resolve no real window at all — no extra heuristic needed here."""
+
+
 async def _page_targets(browser: CdpBrowser) -> list[dict[str, Any]]:
-    """Purpose: list real page-type CDP targets — the one shared fact behind every action needing it.
+    """Purpose: list every REAL, potentially window-visible CDP target — the one shared fact
+    behind every action needing it.
 
     Args:
         browser (CdpBrowser): Client bound to one managed Edge debugging port.
 
     Returns:
-        list[dict[str, Any]]: Every ``Target.getTargets`` entry with ``type == "page"``. Used
-        by ``window-list`` (``tab-list``/``tab-get`` reuse ``window-list``'s full computation instead
-        — see ``_tabs_with_context`` — for window/group context; ``page-list``/``page-get`` were
-        purged and merged into ``tab-list``/``tab-get``, KπX directive: "tab = page... je ne veux pas
-        de duplication inutile") — never a private re-implementation of this exact filter in each
-        handler.
+        list[dict[str, Any]]: Every ``Target.getTargets`` entry with ``type`` in
+        ``_VISIBLE_TARGET_TYPES`` (``"page"`` or ``"browser_ui"`` — see that constant's own
+        rationale). Used by ``window-list`` (``tab-list``/``tab-get`` reuse ``window-list``'s full
+        computation instead — see ``_tabs_with_context`` — for window/group context; ``page-list``/
+        ``page-get`` were purged and merged into ``tab-list``/``tab-get``, KπX directive: "tab =
+        page... je ne veux pas de duplication inutile") — never a private re-implementation of this
+        exact filter in each handler.
 
     Examples:
         >>> asyncio.iscoroutinefunction(_page_targets)
@@ -243,7 +259,9 @@ async def _page_targets(browser: CdpBrowser) -> list[dict[str, Any]]:
         >>> callable(_page_targets)
         True
     """
-    return [target for target in await browser.targets() if target.get("type") == "page"]
+    return [
+        target for target in await browser.targets() if target.get("type") in _VISIBLE_TARGET_TYPES
+    ]
 
 
 async def _window_id_for_target(
@@ -545,7 +563,7 @@ async def _apply_window_layout(
     Args:
         layout (Any): Untrusted ``window-create``/``layout`` payload value — REQUIRED, non-empty
             (a window with zero tabs cannot exist). The SAME shape and field name as
-            ``group-sync``'s ``layout`` — one uniform vocabulary for "describe a window's tab/group
+            ``window-sync``'s ``layout`` — one uniform vocabulary for "describe a window's tab/group
             content", never a second, differently-shaped way to say the same thing.
         browser (CdpBrowser): Client bound to one managed Edge debugging port.
         context (DaemonContext): Daemon state exposing the paired extension (needed for groups).
@@ -635,7 +653,7 @@ async def _window_create(payload: dict[str, Any], context: DaemonContext) -> dic
         payload (dict[str, Any]): Profile, optional CDP window bounds/state, and the REQUIRED,
             non-empty ``layout`` — e.g. ``[{"type":"tab","url":"..."}, {"type":"group","title":
             "...","tabs":["...","..."]}]`` — created in that exact order. One single, uniform way
-            to describe a window's content, the SAME field name and entry shape as ``group-sync``
+            to describe a window's content, the SAME field name and entry shape as ``window-sync``
             — never a separate top-level ``url`` for "the first tab" alongside a batch field for
             "the rest" (root-caused, KπX directive: that split was itself the exact unclean,
             patched-on-afterward duplication this whole tab/group refonte set out to remove).
@@ -718,21 +736,21 @@ async def _window_close(payload: dict[str, Any], context: DaemonContext) -> dict
 @require_preflight("profile", "window_id")
 async def _window_sync(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: reorganize an EXISTING window's own properties AND its whole tab/group content in
-    ONE call — the window-level equivalent of ``group-sync``, "très complet et flexible" (KπX).
+    ONE call, "très complet et flexible" (KπX).
 
     Args:
         payload (dict[str, Any]): Profile, required ``window_id`` (the REAL Edge window to target),
             optional ``bounds`` (``{"left","top","width","height"}``, any subset), optional
             ``state`` (``"normal"|"maximized"|"minimized"|"fullscreen"``), optional ``focused``
-            (bool), optional ``layout`` (the SAME ordered tab/group schema ``window-create``/
-            ``group-sync`` use — reused unchanged, never a second, differently-shaped vocabulary
-            for "describe a window's content").
+            (bool), optional ``layout`` (the SAME ordered tab/group schema ``window-create`` uses
+            — reused unchanged, never a second, differently-shaped vocabulary for "describe a
+            window's content").
         context (DaemonContext): Daemon state exposing the paired extension.
 
     Returns:
         dict[str, Any]: ``window_id``, the extension-confirmed window properties after any
         requested ``bounds``/``state``/``focused`` change, and ``layout`` (present only if a
-        ``layout`` was given) with the SAME shape ``group-sync`` returns.
+        ``layout`` was given).
 
     Raises:
         ValueError: No field beyond ``profile``/``window_id`` given at all (a no-op call).
@@ -740,7 +758,11 @@ async def _window_sync(payload: dict[str, Any], context: DaemonContext) -> dict[
     Notes:
         HITL-gated (KπX directive, GRAVÉ): reorganizing a whole window's structure — its own
         bounds/state and/or its entire tab/group content — is treated as one deliberate, reviewable
-        command, same as its sibling ``group-sync``.
+        command. The standalone ``group-sync`` public action was purged (KπX, GRAVÉ: "purge
+        group-sync vu que inclus dans window-sync") since ``window-sync`` without ``bounds``/
+        ``state``/``focused`` is a strict superset of what it did — the underlying bridge kind
+        ``group.sync``/``handleGroupSync`` still exists internally, called directly here, never
+        publicly exposed as its own top-level ``do`` action anymore.
 
     Examples:
         >>> _window_sync.__name__
@@ -830,7 +852,7 @@ def _layout_from_chrome_layout(chrome_layout: dict[str, Any]) -> list[dict[str, 
             `groups`, `order` — see `_window_list`/`computeWindowLayouts`).
 
     Returns:
-        list[dict[str, Any]]: Same shape `window-create`/`group-sync` accept: `{"type":"tab",
+        list[dict[str, Any]]: Same shape `window-create`/`window-sync` accept: `{"type":"tab",
         "url":...}` or `{"type":"group","title":...,"color"?:...,"tabs":[url,...]}`, in the exact
         real visual order. A tab/group whose member tabs cannot be resolved to a URL is skipped
         (never a broken entry with a missing field) rather than aborting the whole snapshot.
@@ -1195,17 +1217,22 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
         payload (dict[str, Any]): Profile, ``url``, optional ``new_window`` (bool — a genuinely new
             window instead of the current one), optional ``window_id`` (open directly in that
             EXISTING window instead — mutually exclusive with ``new_window``), optional ``group_id``
-            (add the new tab into that EXISTING group/folder the instant it is created), and at
-            most one position hint (``index``/``before_tab_id``/``after_tab_id``, same convention
-            as ``tab-update``).
+            (add the new tab into that EXISTING group/folder the instant it is created), optional
+            ``wait_seconds`` (defaults to `10`, same convention as ``page-navigate``/``page-reload``
+            — how long to wait for the newly created tab's OWN initial load to reach
+            ``document.readyState === "complete"``), and at most one position hint
+            (``index``/``before_tab_id``/``after_tab_id``, same convention as ``tab-update``).
         context (DaemonContext): Daemon state used to resolve the profile and, when ``group_id`` or
             a position is requested, the paired extension (to capture the real chrome tab id and
             apply the placement via the SAME ``tab.update`` mechanism ``tab-update`` uses).
 
     Returns:
-        dict[str, Any]: Profile, CDP ``target_id``, requested ``url`` — plus, whenever a real
-        chrome tab id was resolved, ``tab_id`` and (when a placement was requested) the
-        extension-confirmed ``window_id``/``group_id``/``index`` after that placement.
+        dict[str, Any]: Profile, CDP ``target_id``, requested ``url``, and the last observed
+        ``ready_state`` for that new tab's own initial load (KπX, GRAVÉ: "asymétrie corrigée" —
+        ``tab-create`` used to return before confirming its own tab had even started rendering,
+        unlike ``page-navigate``/``page-reload`` which always do) — plus, whenever a real chrome
+        tab id was resolved, ``tab_id`` and (when a placement was requested) the extension-confirmed
+        ``window_id``/``group_id``/``index`` after that placement.
 
     Raises:
         ValueError: Both ``new_window`` and ``window_id`` given (ambiguous intent).
@@ -1231,6 +1258,7 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
     position_fields = ("index", "before_tab_id", "after_tab_id")
     wants_position = any(payload.get(field) is not None for field in position_fields)
     needs_chrome_id = group_id is not None or wants_position
+    wait_seconds = int(payload.get("wait_seconds", 10))
 
     target_id, chrome_tab_id = await _create_window_tab(
         browser,
@@ -1241,7 +1269,22 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
         capture_chrome_id=needs_chrome_id,
         new_window=new_window,
     )
-    outcome: dict[str, Any] = {"profile": name, "target_id": target_id, "url": url}
+    ready_state = ""
+    for _ in range(max(1, int(wait_seconds / 0.2))):
+        result = await browser.page_session(
+            target_id,
+            [("Runtime.evaluate", {"expression": "document.readyState", "returnByValue": True})],
+        )
+        ready_state = str(result[0].get("result", {}).get("value", ""))
+        if ready_state == "complete":
+            break
+        await asyncio.sleep(0.2)
+    outcome: dict[str, Any] = {
+        "profile": name,
+        "target_id": target_id,
+        "url": url,
+        "ready_state": ready_state,
+    }
     if chrome_tab_id is None:
         return outcome
     outcome["tab_id"] = chrome_tab_id
@@ -1522,6 +1565,267 @@ async def _bookmark_update(payload: dict[str, Any], context: DaemonContext) -> d
     return await _extension(payload, context, "bookmark.update")
 
 
+async def _extension_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: list EVERY installed extension/app/theme in this Edge profile with full detail —
+    absolute finesse over the WHOLE extension ecosystem, not just this one (KπX, GRAVÉ: "gérer les
+    extensions... implémente full ce qui est possible").
+
+    Args:
+        payload (dict[str, Any]): Profile only.
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{extensions: [...]}`` — one fully-detailed entry per
+        installed item, including real ``permissions``/``host_permissions`` AND their
+        human-readable ``permission_warnings`` (never raw permission strings alone).
+
+    Examples:
+        >>> _extension_list.__name__
+        '_extension_list'
+        >>> callable(_extension_list)
+        True
+    """
+    return await _extension(payload, context, "extension.list")
+
+
+async def _extension_get(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: read ALL available detail about ONE installed extension/app/theme — same
+    "everything about ONE X" philosophy as ``tab-get``/``bookmark-get``, extended to extensions.
+
+    Args:
+        payload (dict[str, Any]): Profile and required ``id`` (a real ``chrome.management``
+            extension id).
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed full detail for that one extension.
+
+    Examples:
+        >>> _extension_get.__name__
+        '_extension_get'
+        >>> callable(_extension_get)
+        True
+    """
+    return await _extension(payload, context, "extension.get")
+
+
+@require_preflight("ids")
+async def _extension_enable(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: enable one or MORE installed extensions, batch, in ONE call — deliberately NOT
+    approval-gated (KπX directive): re-enabling an already-installed extension is a low-risk,
+    directly observable, reversible action (unlike `extension-disable`, which stays approval-gated
+    since it can silently turn off a security-relevant extension the user still trusts).
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty ``ids`` (real extension ids).
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{updated: [{id, name, enabled}, ...]}``.
+
+    Examples:
+        >>> _extension_enable.__name__
+        '_extension_enable'
+        >>> callable(_extension_enable)
+        True
+    """
+    return await _extension(payload, context, "extension.enable")
+
+
+@require_approval
+@require_preflight("ids")
+async def _extension_disable(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: disable one or MORE installed extensions, batch, in ONE call.
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty ``ids`` (real extension ids).
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{updated: [{id, name, enabled}, ...]}``.
+
+    Examples:
+        >>> _extension_disable.__name__
+        '_extension_disable'
+        >>> callable(_extension_disable)
+        True
+    """
+    return await _extension(payload, context, "extension.disable")
+
+
+async def _extension_reload(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: restart the paired extension's OWN service worker to pick up newly deployed code —
+    "répondre avant de couper": the response reaches the daemon BEFORE the reload happens, never
+    after (KπX, GRAVÉ: this exact reload used to require a manual click in ``edge://extensions/``
+    after every code change this session).
+
+    Args:
+        payload (dict[str, Any]): Profile only.
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{reloading: true, id, name, version}`` (the paired
+        extension's own identity) — never approval-gated: it only restarts OUR OWN plumbing, no
+        user data at risk, matching ``window-create``/``tab-create``'s "directly observable, safe"
+        rationale. The extension's own `chrome.runtime.reload()` is deliberately scheduled 200ms
+        AFTER this response is sent, so the daemon never sees a dropped connection before getting
+        its answer.
+
+    Examples:
+        >>> _extension_reload.__name__
+        '_extension_reload'
+        >>> callable(_extension_reload)
+        True
+    """
+    return await _extension(payload, context, "extension.reload")
+
+
+_EXTENSION_STORE_SEARCH_URLS: dict[str, str] = {
+    "edge": "https://microsoftedge.microsoft.com/addons/search/{query}",
+    "chrome": "https://chromewebstore.google.com/search/{query}",
+}
+"""Public, human-facing search result pages — NOT an official API (researched live: neither
+Microsoft nor Google publishes one; Chrome Web Store's own Developer Program Policies explicitly
+flag automated scraping of store metadata as a policy risk). This action reads the same page a
+human would see in a real tab, via the exact same CDP primitives ``page-navigate``/``page-evaluate``
+already expose — never a private/internal JSON endpoint."""
+
+_EXTENSION_SEARCH_RESULT_LIMIT = 20
+"""Default cap on returned search results — bounds the size of a best-effort DOM scrape."""
+
+_EXTENSION_SEARCH_EXTRACT_JS = """
+(function () {
+  const seen = new Map();
+  const anchors = document.querySelectorAll('a[href*="/detail/"]');
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    const match = href.match(/\\/detail\\/([^/]+)\\/([a-p]{32})/);
+    if (!match) continue;
+    const [, slug, id] = match;
+    if (seen.has(id)) continue;
+    let node = a;
+    for (let i = 0; i < 2 && node.parentElement; i++) node = node.parentElement;
+    const lines = node.innerText.trim().split("\\n").map((line) => line.trim()).filter(Boolean);
+    seen.set(id, { id, slug, text_block: lines.slice(0, 6) });
+  }
+  return Array.from(seen.values());
+})()
+"""
+"""Best-effort DOM extraction shared by both stores — real `/detail/<slug>/<32-char-id>` links are
+the one stable, structural signal on either page; everything else (name, rating, developer,
+description) is read as raw nearby text, never guaranteed to map to the same field across a page
+markup change on either store's side."""
+
+
+async def _extension_search(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: search a real Edge Add-ons or Chrome Web Store search results page for installable
+    extensions — live-verified (KπX, GRAVÉ: "il faut un extension search qui fouille chrome
+    webstore edge addons... vu que edge compatible avec chrome").
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``store`` (``"edge"`` or ``"chrome"``),
+            required non-empty ``query``, and optional ``limit`` (defaults to 20).
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: ``{profile, store, query, results: [{id, slug, text_block}, ...]}`` — a
+        temporary tab is created, navigated, scraped, and closed within this ONE call, leaving no
+        trace. On Chrome Web Store specifically, Google's own consent interstitial is dismissed
+        first (`Reject all`) since it otherwise blocks the real results entirely.
+
+    Raises:
+        ValueError: An unknown ``store``, or an empty ``query``.
+
+    Examples:
+        >>> _extension_search.__name__
+        '_extension_search'
+        >>> callable(_extension_search)
+        True
+    """
+    name, browser = _profile(payload, context)
+    store = str(payload.get("store", "")).strip().lower()
+    if store not in _EXTENSION_STORE_SEARCH_URLS:
+        raise ValueError(f"store must be one of {sorted(_EXTENSION_STORE_SEARCH_URLS)}")
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = int(payload.get("limit", _EXTENSION_SEARCH_RESULT_LIMIT))
+    url = _EXTENSION_STORE_SEARCH_URLS[store].format(query=urllib.parse.quote(query))
+    target_id, _ = await _create_window_tab(browser, context, name, None, url, False)
+    try:
+        await _wait_for_search_results(browser, target_id)
+        if store == "chrome":
+            await browser.page_session(
+                target_id,
+                [
+                    (
+                        "Runtime.evaluate",
+                        {
+                            "expression": (
+                                "(function(){const b=Array.from("
+                                "document.querySelectorAll('button')).find("
+                                "x=>x.textContent.trim()==='Reject all'); "
+                                "if (b) b.click(); return !!b;})()"
+                            ),
+                            "returnByValue": True,
+                        },
+                    )
+                ],
+            )
+            await _wait_for_search_results(browser, target_id)
+        extracted = await browser.page_session(
+            target_id,
+            [
+                (
+                    "Runtime.evaluate",
+                    {"expression": _EXTENSION_SEARCH_EXTRACT_JS, "returnByValue": True},
+                )
+            ],
+        )
+        results = extracted[0].get("result", {}).get("value", []) or []
+    finally:
+        await browser.call("Target.closeTarget", {"targetId": target_id})
+    return {"profile": name, "store": store, "query": query, "results": results[:limit]}
+
+
+async def _wait_for_search_results(
+    browser: CdpBrowser, target_id: str, wait_seconds: float = 15.0
+) -> None:
+    """Purpose: poll a search results page until it has rendered at least one real detail link.
+
+    Args:
+        browser (CdpBrowser): Attached CDP session used to poll the page.
+        target_id (str): CDP page target ID hosting the search results.
+        wait_seconds (float): Maximum total polling time, in seconds.
+
+    Returns:
+        None: Returns as soon as a real result link is found, or once ``wait_seconds`` elapses —
+        never raises on a genuinely empty (zero-result) search.
+
+    Examples:
+        >>> asyncio.iscoroutinefunction(_wait_for_search_results)
+        True
+        >>> callable(_wait_for_search_results)
+        True
+    """
+    for _ in range(max(1, int(wait_seconds / 0.3))):
+        probe = await browser.page_session(
+            target_id,
+            [
+                (
+                    "Runtime.evaluate",
+                    {
+                        "expression": "document.querySelectorAll('a[href*=\"/detail/\"]').length",
+                        "returnByValue": True,
+                    },
+                )
+            ],
+        )
+        if int(probe[0].get("result", {}).get("value", 0) or 0) > 0:
+            return
+        await asyncio.sleep(0.3)
+
+
 async def _page_navigate(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: navigate an Edge page target to a URL and wait for document readiness.
 
@@ -1684,16 +1988,34 @@ async def _resolve_box(browser: CdpBrowser, target_id: str, selector: str) -> tu
         >>> callable(_resolve_box)
         True
     """
-    document = await browser.page_session(target_id, [("DOM.getDocument", {"depth": -1})])
-    root_id = document[0].get("root", {}).get("nodeId")
-    node = await browser.page_session(
-        target_id, [("DOM.querySelector", {"nodeId": root_id, "selector": selector})]
+    # All three DOM-domain calls MUST share the exact same attached CDP session (a single
+    # `page_session()` invocation) — root-caused live (KπX, GRAVÉ): each `page_session()` call
+    # attaches a brand-new session then detaches it; `DOM.getDocument`'s `nodeId`s are scoped to
+    # the DOM agent of the session that minted them, so resolving `querySelector`/`getBoxModel`
+    # against them from a LATER, separately-attached session deterministically fails with
+    # `Could not find node with given id` — reproduced on EVERY call, not intermittent, confirmed
+    # on a freshly navigated, unmutated page. Splitting these 3 calls across 3 separate
+    # `page_session()` calls was the exact bug; chaining them within ONE call (one attach, one
+    # detach), each later call's params resolved from the earlier calls' real results via
+    # `CdpParams`'s callable form, is the fix.
+    _, node, box = await browser.page_session(
+        target_id,
+        [
+            ("DOM.getDocument", {"depth": -1}),
+            (
+                "DOM.querySelector",
+                lambda results: {
+                    "nodeId": results[0].get("root", {}).get("nodeId"),
+                    "selector": selector,
+                },
+            ),
+            ("DOM.getBoxModel", lambda results: {"nodeId": results[1].get("nodeId", 0)}),
+        ],
     )
-    node_id = node[0].get("nodeId", 0)
+    node_id = node.get("nodeId", 0)
     if not node_id:
         raise ValueError(f"element not found: {selector}")
-    box = await browser.page_session(target_id, [("DOM.getBoxModel", {"nodeId": node_id})])
-    quad = box[0]["model"]["content"]
+    quad = box["model"]["content"]
     return (quad[0] + quad[4]) / 2, (quad[1] + quad[5]) / 2
 
 
@@ -2073,26 +2395,62 @@ async def _page_query(payload: dict[str, Any], context: DaemonContext) -> dict[s
     selector = str(payload.get("selector", ""))
     if not target_id or not selector:
         raise ValueError("target_id and selector are required")
-    document = await browser.page_session(target_id, [("DOM.getDocument", {"depth": -1})])
-    root_id = document[0].get("root", {}).get("nodeId")
-    found = await browser.page_session(
-        target_id, [("DOM.querySelectorAll", {"nodeId": root_id, "selector": selector})]
-    )
-    node_ids = found[0].get("nodeIds", [])
+    # ONE bundled session for the whole chain (KπX, GRAVÉ — same root cause as `_resolve_box`):
+    # `DOM.getDocument`'s `nodeId`s never survive a separate `page_session()` attach/detach cycle.
+    # `depth: -1` already returns the FULL recursive subtree, so tag/attributes are read directly
+    # from that ONE tree client-side — never a per-match `DOM.describeNode` round trip, which would
+    # have reintroduced the exact same cross-session bug for a variable-length batch of node ids.
+    calls: list[tuple[str, CdpParams]] = [
+        ("DOM.getDocument", {"depth": -1}),
+        (
+            "DOM.querySelectorAll",
+            lambda results: {
+                "nodeId": results[0].get("root", {}).get("nodeId"),
+                "selector": selector,
+            },
+        ),
+    ]
+    document, found = await browser.page_session(target_id, calls)
+    node_ids = found.get("nodeIds", [])
     if not node_ids:
         return {"profile": name, "target_id": target_id, "selector": selector, "matches": []}
-    described = await browser.page_session(
-        target_id, [("DOM.describeNode", {"nodeId": node_id}) for node_id in node_ids]
-    )
+    by_node_id: dict[int, dict[str, Any]] = {}
+    _index_dom_tree(document.get("root", {}), by_node_id)
     matches = [
         {
             "node_id": node_id,
-            "tag": item.get("node", {}).get("nodeName", ""),
-            "attributes": item.get("node", {}).get("attributes", []),
+            "tag": by_node_id.get(node_id, {}).get("nodeName", ""),
+            "attributes": by_node_id.get(node_id, {}).get("attributes", []),
         }
-        for node_id, item in zip(node_ids, described)
+        for node_id in node_ids
     ]
     return {"profile": name, "target_id": target_id, "selector": selector, "matches": matches}
+
+
+def _index_dom_tree(node: dict[str, Any], by_node_id: dict[int, dict[str, Any]]) -> None:
+    """Purpose: flatten one `DOM.getDocument(depth=-1)` recursive subtree into a `nodeId` lookup.
+
+    Args:
+        node (dict[str, Any]): One CDP DOM node (with an optional ``children`` list).
+        by_node_id (dict[int, dict[str, Any]]): Accumulator mutated in place — ``nodeId`` to the
+            real node object, for every node in the subtree.
+
+    Returns:
+        None: Mutates ``by_node_id`` in place; recurses into ``children`` and ``shadowRoots``.
+
+    Examples:
+        >>> acc: dict[int, dict[str, Any]] = {}
+        >>> _index_dom_tree({"nodeId": 1, "nodeName": "DIV", "children": []}, acc)
+        >>> acc[1]["nodeName"]
+        'DIV'
+    """
+    node_id = node.get("nodeId")
+    if isinstance(node_id, int):
+        by_node_id[node_id] = node
+    for child in node.get("children", []) or []:
+        _index_dom_tree(child, by_node_id)
+    for shadow_root in node.get("shadowRoots", []) or []:
+        _index_dom_tree(shadow_root, by_node_id)
 
 
 async def _page_console_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -2206,33 +2564,6 @@ async def _page_dialog_policy(payload: dict[str, Any], context: DaemonContext) -
     )
     await browser.page_session(target_id, [("Runtime.evaluate", {"expression": expression})])
     return {"profile": name, "target_id": target_id, "policy": action}
-
-
-async def _page_set_download_behavior(
-    payload: dict[str, Any], context: DaemonContext
-) -> dict[str, Any]:
-    """Purpose: configure the browser-level automatic download destination directory.
-
-    Args:
-        payload (dict[str, Any]): Profile and required local ``path``.
-        context (DaemonContext): Daemon state used to resolve the Edge profile.
-
-    Returns:
-        dict[str, Any]: Profile, configured path, and a confirmed configured flag.
-
-    Examples:
-        >>> _page_set_download_behavior.__name__
-        '_page_set_download_behavior'
-        >>> callable(_page_set_download_behavior)
-        True
-    """
-    name, browser = _profile(payload, context)
-    path = str(payload.get("path", ""))
-    if not path:
-        raise ValueError("path is required")
-    Path(path).mkdir(parents=True, exist_ok=True)
-    await browser.call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": path})
-    return {"profile": name, "path": path, "configured": True}
 
 
 async def _cookie_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -2502,37 +2833,6 @@ async def _group_remove_tabs(payload: dict[str, Any], context: DaemonContext) ->
     return await _extension(payload, context, "group.remove_tabs")
 
 
-@require_approval
-@require_preflight("layout")
-async def _group_sync(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: reorganize a WHOLE window's tab/group structure in ONE call — absolute flexibility.
-
-    Args:
-        payload (dict[str, Any]): Profile and required ``layout``: an ORDERED list processed left
-            to right, each entry either ``{"type":"tab","tab_id":N}`` (a standalone, ungrouped tab
-            at this position) or ``{"type":"group","group_id":N|omitted,"title":str,"color":str,
-            "tab_ids":[N,...]}`` (a whole group at this position — ``group_id`` given reuses/
-            renames/recolors/adds-to that EXACT existing group; omitted creates a brand-new group).
-        context (DaemonContext): Daemon state exposing the paired extension.
-
-    Returns:
-        dict[str, Any]: Extension-confirmed ``{layout: [...]}`` — one entry per input entry, same
-        order, each carrying the real ``tab_id`` or the real (possibly newly created) ``group_id``.
-
-    Notes:
-        Now ``@require_approval`` (KπX directive, GRAVÉ — a reversal from the original
-        "deliberately not approval-gated" stance): reorganizing a whole window's structure is now
-        treated as one deliberate, reviewable command, same as its new sibling ``window-sync``.
-
-    Examples:
-        >>> _group_sync.__name__
-        '_group_sync'
-        >>> callable(_group_sync)
-        True
-    """
-    return await _extension(payload, context, "group.sync")
-
-
 async def _browser_ask_user(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: ask the human operator a question through the paired extension overlay.
 
@@ -2740,6 +3040,12 @@ REGISTRY = {
         _action("bookmark-create", "Bookmarks", _bookmark_create),
         _action("bookmark-remove", "Bookmarks", _bookmark_remove),
         _action("bookmark-update", "Bookmarks", _bookmark_update),
+        _action("extension-list", "Extensions", _extension_list),
+        _action("extension-get", "Extensions", _extension_get),
+        _action("extension-enable", "Extensions", _extension_enable),
+        _action("extension-disable", "Extensions", _extension_disable),
+        _action("extension-reload", "Extensions", _extension_reload),
+        _action("extension-search", "Extensions", _extension_search),
         _action("page-navigate", "Navigation", _page_navigate),
         _action("page-reload", "Navigation", _page_reload),
         _action("page-back", "Navigation", _page_back),
@@ -2757,7 +3063,6 @@ REGISTRY = {
         _action("page-console-list", "Inspection", _page_console_list),
         _action("page-network-list", "Inspection", _page_network_list),
         _action("page-dialog-policy", "Dialogs", _page_dialog_policy),
-        _action("page-set-download-behavior", "Downloads", _page_set_download_behavior),
         _action("cookie-list", "Cookies", _cookie_list),
         _action("cookie-set", "Cookies", _cookie_set),
         _action("cookie-remove", "Cookies", _cookie_remove),
@@ -2768,7 +3073,6 @@ REGISTRY = {
         _action("group-move", "Groups", _group_move),
         _action("group-add-tabs", "Groups", _group_add_tabs),
         _action("group-remove-tabs", "Groups", _group_remove_tabs),
-        _action("group-sync", "Groups", _group_sync),
         _action("browser-ask-user", "HumanInTheLoop", _browser_ask_user),
         _action("browser-dismiss-overlays", "HumanInTheLoop", _browser_dismiss_overlays),
         _action("browser-solve-captcha", "HumanInTheLoop", _browser_solve_captcha),
