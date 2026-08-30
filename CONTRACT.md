@@ -61,7 +61,6 @@ browser-proxy admin <command>                                              # lif
 | `admin install` | Register the daemon as a user service | `systemctl --user link` + `enable` on `systemd/browser-proxy.service` | ❌ |
 | `admin start` | Start the daemon, verify with a ping | `systemctl --user start browser-proxy.service` then RPC `ping` | ❌ |
 | `admin stop` | Graceful daemon shutdown | `systemctl --user stop browser-proxy.service` | ❌ |
-| `admin doctor` | Redacted health snapshot | RPC `ping` + `shutil.which("microsoft-edge")` + `ExtensionBridge()._token() != ""` — no secret values ever included | ❌ |
 | `admin extension pair` | Store the extension-generated pairing secret | hidden terminal prompt (`typer.prompt(..., hide_input=True)`) → `ExtensionBridge().pair(secret)` → mode-0600 local file write; secret never prints, enters shell history, logs, or chat | ❌ |
 | `admin edge install` | Register the Edge unit template | `systemctl --user link` on `systemd/browser-proxy-edge@.service` (once per machine, not per profile) | ❌ |
 | `admin edge start <profile>` | Materialize then start one profile's Edge instance | `materialize_edge_profile(profile)` then `systemctl --user start browser-proxy-edge@<profile>.service` — **always opens a real, visible window** | ❌ |
@@ -720,7 +719,7 @@ it: `{"type":"handshake","token":"...","extension_id":"...","profile":"<declared
 `payload["profile"]`) both route to that one exact connection, never any other. A request for a
 profile with no matching connection fails closed: `EXTENSION_UNAVAILABLE: <profile>`, naming the
 exact profile instead of a bare boolean. `_extension()` echoes `"profile"` in every response,
-confirming which profile actually answered. `admin status`/`admin doctor`/`ping` expose
+confirming which profile actually answered. `admin status`/`ping` expose
 `extension_connected_profiles: [...]` (list of every currently-connected profile) alongside the
 pre-existing coarse `extension_connected: bool` — the same "one precise predicate, never a hiding
 aggregate" discipline as `paths.edge_profile_state()`.

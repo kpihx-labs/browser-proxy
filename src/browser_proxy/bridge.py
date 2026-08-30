@@ -172,7 +172,7 @@ class ExtensionBridge:
         Returns:
             tuple[str, ...]: Sorted profile names, never a bare aggregate boolean — the same
             "one predicate everywhere" discipline as ``paths.edge_profile_state()``, so
-            ``admin status``/``admin doctor`` can never hide which specific profile is attached.
+            ``admin status`` can never hide which specific profile is attached.
 
         Examples:
             >>> ExtensionBridge().connected_profiles()

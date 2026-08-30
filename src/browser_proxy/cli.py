@@ -262,6 +262,12 @@ def _register(action_name: str) -> None:
         output_format: Annotated[
             str, typer.Option("--format", "-f", help="Output format: json (default) or table.")
         ] = "json",
+        wait_for_cdp: Annotated[
+            bool,
+            typer.Option(
+                "--wait-for-cdp", help="Wait for CDP instead of failing on CDP_UNAVAILABLE."
+            ),
+        ] = False,
     ) -> None:
         """Purpose: dispatch one documented registry action using one JSON payload.
 
@@ -269,6 +275,7 @@ def _register(action_name: str) -> None:
             payload (str | None): Inline JSON object, JSON file path, or no payload for ``{}``.
             output (Path | None): Optional file that receives the full result envelope.
             output_format (str): Presentation mode, either ``json`` or ``table``.
+            wait_for_cdp (bool): Loop safely if the daemon returns CDP_UNAVAILABLE.
 
         Returns:
             ``None`` after printing the JSON envelope.
@@ -280,12 +287,28 @@ def _register(action_name: str) -> None:
             True
         """
 
-        try:
-            envelope = asyncio.run(
-                request("do", {"action": action_name, "payload": _payload(payload)})
-            )
-        except (OSError, ValueError, json.JSONDecodeError, typer.BadParameter) as error:
-            envelope = Envelope.error("VALIDATION_ERROR", message=str(error))
+        import time
+
+        start = time.monotonic()
+        while True:
+            try:
+                envelope = asyncio.run(
+                    request("do", {"action": action_name, "payload": _payload(payload)})
+                )
+            except (OSError, ValueError, json.JSONDecodeError, typer.BadParameter) as error:
+                envelope = Envelope.error("VALIDATION_ERROR", message=str(error))
+
+            if (
+                wait_for_cdp
+                and envelope.meta.status == "error"
+                and "CDP_UNAVAILABLE" in str(envelope.meta.comment)
+            ):
+                if time.monotonic() - start > 15.0:  # timeout after 15s
+                    break
+                time.sleep(1.0)
+                continue
+            break
+
         _emit_do(action_name, envelope, output, output_format)
 
     _command.__name__ = action_name.replace("-", "_")
@@ -418,36 +441,6 @@ def admin_stop() -> None:
         _emit(result, None)
         return
     _emit(_systemctl("stop", "browser-proxy.service"), None)
-
-
-@admin_app.command("doctor")
-def admin_doctor() -> None:
-    """Purpose: report Edge, pairing, and daemon health without secret values.
-
-    Args:
-        None: Inspects local executable availability and daemon reachability.
-
-    Returns:
-        None: Emits a redacted health envelope.
-
-    Examples:
-        >>> callable(admin_doctor)
-        True
-        >>> admin_doctor.__name__
-        'admin_doctor'
-    """
-    status = asyncio.run(request("ping", {}))
-    _emit(
-        Envelope.ok(
-            {
-                "edge_only": True,
-                "edge_binary": bool(shutil.which("microsoft-edge")),
-                "daemon": status.model_dump(),
-                "pairing_configured": ExtensionBridge()._token() != "",
-            }
-        ),
-        None,
-    )
 
 
 extension_app = typer.Typer(

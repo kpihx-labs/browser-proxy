@@ -158,7 +158,7 @@
   now extracts `payload["profile"]`, so approval overlays always appear in the correct window) both
   route exclusively to that one connection. A request for an unconnected profile fails closed by
   name: `EXTENSION_UNAVAILABLE: <profile>`. `_extension()` now echoes `"profile"` in every response
-  so callers can always confirm which profile actually answered. `admin status`/`admin doctor`/
+  so callers can always confirm which profile actually answered. `admin status`/
   `ping` gained `extension_connected_profiles: [...]` (precise per-profile truth) alongside the
   pre-existing `extension_connected: bool` (kept, zero information loss). New regression test
   (`test_two_profiles_stay_isolated_and_are_never_answered_by_the_wrong_extension`) proves two

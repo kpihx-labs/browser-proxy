@@ -10,7 +10,9 @@ Examples:
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator, Callable, Sequence
+import subprocess
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 from urllib.request import urlopen
@@ -97,6 +99,7 @@ class CdpBrowser:
 
     Args:
         port: Loopback remote-debugging port for a managed Edge profile.
+        profile: The managed profile name (used for auto-recovery).
         _next_id: Monotonic CDP request identifier.
         _pending: Responses received before the awaited request.
 
@@ -111,6 +114,7 @@ class CdpBrowser:
     """
 
     port: int
+    profile: str = ""
     _next_id: int = 0
 
     async def _browser_ws_url(self) -> str:
@@ -141,6 +145,44 @@ class CdpBrowser:
             raise RuntimeError("CDP_UNAVAILABLE: browser endpoint absent")
         return endpoint
 
+    async def _with_retry(self, coro_func: Callable[[], Awaitable[Any]]) -> Any:
+        """Purpose: Wrap a CDP call with auto-recovery logic.
+
+        Args:
+            coro_func (Callable): The CDP execution coroutine.
+
+        Returns:
+            The result of the CDP execution.
+
+        Examples:
+            >>> CdpBrowser(9222)._with_retry.__name__
+            '_with_retry'
+            >>> asyncio.iscoroutinefunction(CdpBrowser._with_retry)
+            True
+        """
+        start = time.monotonic()
+        last_err = None
+        while time.monotonic() - start < 3.0:
+            try:
+                return await coro_func()
+            except Exception as e:
+                if "CDP_UNAVAILABLE" in str(e) or isinstance(e, OSError):
+                    last_err = e
+                    if self.profile:
+                        subprocess.run(
+                            [
+                                "systemctl",
+                                "--user",
+                                "start",
+                                f"browser-proxy-edge@{self.profile}.service",
+                            ],
+                            check=False,
+                        )
+                    await asyncio.sleep(0.5)
+                else:
+                    raise
+        raise RuntimeError(f"CDP_UNAVAILABLE: failed after 3s retries (last error: {last_err})")
+
     async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Purpose: issue one browser-level CDP method and return its result object.
 
@@ -158,23 +200,37 @@ class CdpBrowser:
             True
         """
 
-        self._next_id += 1
-        request_id = self._next_id
-        async with connect(
-            await self._browser_ws_url(), max_size=_cdp_max_frame_bytes()
-        ) as websocket:
-            await websocket.send(json.dumps({"id": request_id, "method": method, "params": params}))
-            async for raw in _messages(websocket):
-                response = json.loads(raw)
-                if response.get("id") != request_id:
-                    continue
-                if error := response.get("error"):
-                    raise RuntimeError(f"CDP_ERROR: {error.get('message', error)}")
-                result = cast(dict[str, Any], response.get("result", {}))
-                if not isinstance(result, dict):
-                    raise RuntimeError("CDP_ERROR: non-object result")
-                return result
-        raise RuntimeError("CDP_UNAVAILABLE: connection closed")
+        async def _inner() -> dict[str, Any]:
+            """Purpose: run actual logic.
+            Args: None.
+            Returns: dict.
+            Examples:
+                >>> True
+                True
+                >>> False
+                False
+            """
+            self._next_id += 1
+            request_id = self._next_id
+            async with connect(
+                await self._browser_ws_url(), max_size=_cdp_max_frame_bytes()
+            ) as websocket:
+                await websocket.send(
+                    json.dumps({"id": request_id, "method": method, "params": params})
+                )
+                async for raw in _messages(websocket):
+                    response = json.loads(raw)
+                    if response.get("id") != request_id:
+                        continue
+                    if error := response.get("error"):
+                        raise RuntimeError(f"CDP_ERROR: {error.get('message', error)}")
+                    result = cast(dict[str, Any], response.get("result", {}))
+                    if not isinstance(result, dict):
+                        raise RuntimeError("CDP_ERROR: non-object result")
+                    return result
+            raise RuntimeError("CDP_UNAVAILABLE: connection closed")
+
+        return await self._with_retry(_inner)
 
     async def targets(self) -> list[dict[str, Any]]:
         """Purpose: return inspectable CDP targets for this Edge profile.
@@ -262,69 +318,84 @@ class CdpBrowser:
             >>> CdpBrowser(9222)._next_id
             0
         """
-        async with connect(
-            await self._browser_ws_url(), max_size=_cdp_max_frame_bytes()
-        ) as websocket:
-            self._next_id += 1
-            attach_id = self._next_id
-            await websocket.send(
-                json.dumps(
-                    {
-                        "id": attach_id,
-                        "method": "Target.attachToTarget",
-                        "params": {"targetId": target_id, "flatten": True},
-                    }
-                )
-            )
-            session_id: str | None = None
-            async for raw in _messages(websocket):
-                response = json.loads(raw)
-                if response.get("id") == attach_id:
-                    result = response.get("result", {})
-                    session_id = result.get("sessionId") if isinstance(result, dict) else None
-                    break
-            if not session_id:
-                raise RuntimeError("CDP_ERROR: attach did not return sessionId")
-            results: list[dict[str, Any]] = []
-            try:
-                for method, raw_params in calls:
-                    resolved_params = raw_params(results) if callable(raw_params) else raw_params
-                    self._next_id += 1
-                    call_id = self._next_id
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "id": call_id,
-                                "sessionId": session_id,
-                                "method": method,
-                                "params": resolved_params,
-                            }
-                        )
-                    )
-                    async for raw in _messages(websocket):
-                        response = json.loads(raw)
-                        if (
-                            response.get("id") == call_id
-                            and response.get("sessionId") == session_id
-                        ):
-                            if error := response.get("error"):
-                                raise RuntimeError(f"CDP_ERROR: {error.get('message', error)}")
-                            result = response.get("result", {})
-                            results.append(result if isinstance(result, dict) else {})
-                            break
-            finally:
+
+        async def _inner() -> list[dict[str, Any]]:
+            """Purpose: run inner logic.
+            Args: None.
+            Returns: list.
+            Examples:
+                >>> True
+                True
+                >>> False
+                False
+            """
+            async with connect(
+                await self._browser_ws_url(), max_size=_cdp_max_frame_bytes()
+            ) as websocket:
                 self._next_id += 1
-                detach_id = self._next_id
+                attach_id = self._next_id
                 await websocket.send(
                     json.dumps(
                         {
-                            "id": detach_id,
-                            "method": "Target.detachFromTarget",
-                            "params": {"sessionId": session_id},
+                            "id": attach_id,
+                            "method": "Target.attachToTarget",
+                            "params": {"targetId": target_id, "flatten": True},
                         }
                     )
                 )
+                session_id: str | None = None
+                async for raw in _messages(websocket):
+                    response = json.loads(raw)
+                    if response.get("id") == attach_id:
+                        result = response.get("result", {})
+                        session_id = result.get("sessionId") if isinstance(result, dict) else None
+                        break
+                if not session_id:
+                    raise RuntimeError("CDP_ERROR: attach did not return sessionId")
+                results: list[dict[str, Any]] = []
+                try:
+                    for method, raw_params in calls:
+                        resolved_params = (
+                            raw_params(results) if callable(raw_params) else raw_params
+                        )
+                        self._next_id += 1
+                        call_id = self._next_id
+                        await websocket.send(
+                            json.dumps(
+                                {
+                                    "id": call_id,
+                                    "sessionId": session_id,
+                                    "method": method,
+                                    "params": resolved_params,
+                                }
+                            )
+                        )
+                        async for raw in _messages(websocket):
+                            response = json.loads(raw)
+                            if (
+                                response.get("id") == call_id
+                                and response.get("sessionId") == session_id
+                            ):
+                                if error := response.get("error"):
+                                    raise RuntimeError(f"CDP_ERROR: {error.get('message', error)}")
+                                result = response.get("result", {})
+                                results.append(result if isinstance(result, dict) else {})
+                                break
+                finally:
+                    self._next_id += 1
+                    detach_id = self._next_id
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "id": detach_id,
+                                "method": "Target.detachFromTarget",
+                                "params": {"sessionId": session_id},
+                            }
+                        )
+                    )
             return results
+
+        return await self._with_retry(_inner)
 
 
 async def _messages(websocket: Any) -> AsyncIterator[str]:

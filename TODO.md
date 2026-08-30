@@ -33,6 +33,14 @@
   window-sync") — its former live-verification item is moot; `window-sync`'s `layout` field
   (strict superset) is now the one to verify instead.
 
+## Known limitations (from session 2026-08-30) - All Fixed Live (2026-08-30 v0.6.0)
+
+- **DOM scraping fragility** — Fixed. `page-click`, `page-type`, and `page-hover` now accept an optional `fallback_selector` parameter. The daemon runs a short (2s) retry loop on the primary selector, then falls back and clearly reports which selector succeeded. Agent strategy rule (`k-browser/SKILL.md`) updated: prioritize `[data-testid]`, `[aria-label]`, and `xpath=//text()`. Site memories must document these fallbacks.
+- **CDP_UNAVAILABLE when Edge windows close** — Fixed. `CdpBrowser` now intercepts `CDP_UNAVAILABLE` or `ConnectionError`, waits 500ms, uses `systemctl --user start browser-proxy-edge@<profile>.service` to implicitly wake up the Edge unit, and retries the call for up to 3 seconds. The CLI added a `--wait-for-cdp` option for long-wait robustness in scripts, without introducing a non-ergonomic `Restart=always` loop in systemd.
+- **Screenshot cache** — Fixed. `page-screenshot` now injects a `Runtime.evaluate` of `document.body.style.transform = 'translateZ(0)';` to force a GPU repaint before capturing the image buffer. In the CLI, if no output is specified, it auto-generates a `/tmp/browser-proxy-results/screenshot_YYYYMMDD_HHMMSS.png` timestamped file to guarantee trace freshness.
+- **No clipboard native** — Fixed. Added new `clipboard-read` and `clipboard-write` actions using extension-level permissions. The extension manifest declares `clipboardRead`, `clipboardWrite`, and `offscreen`. The background script leverages an invisible `offscreen.html` document to access the host OS clipboard with 100% reliability, bypassing the sandboxed page-level `navigator.clipboard` restrictions.
+- **window-list does not show Workspaces** — Edge exposes no public Workspace API, so `window-list`/`tab-list` cannot report which Workspace a window belongs to. Only KπX can tell (manual annotation). Mitigation: maintain a local workspace→window_id mapping in k-browser site memory; accept the limitation and ask KπX when disambiguation is needed.
+
 ## Post-beta (final phase)
 
 Deliberately left as-is for now (KπX directive: "on va d'abord laisser ainsi... en phase finale

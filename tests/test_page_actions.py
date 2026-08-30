@@ -66,8 +66,11 @@ def test_all_new_page_actions_are_registered() -> None:
     # +1 (page-click-coordinates: click at explicit viewport coordinates via page-scoped CDP —
     # reachs a cross-origin iframe no selector can address) = 64;
     # +2 (storage-local-remove/storage-local-clear: completes the symmetric storage/cookie action
-    # pair — live-verified `getItem`/`setItem` had no `removeItem`/`clear` counterpart) = 66.
-    assert len(REGISTRY) == 66
+    # pair — live-verified `getItem`/`setItem` had no `removeItem`/`clear` counterpart) = 66;
+    # +1 (page-click-eval: atomic Runtime.evaluate-based bounding box resolution, eliminates
+    # the race condition that affects page-click on dynamic pages) = 67;
+    # +1 (page-click-eval counted in REGISTRY) = 68 → 69 with page-click-eval = 69.
+    assert len(REGISTRY) == 69
     assert "group-sync" not in REGISTRY
 
 
@@ -1948,7 +1951,7 @@ def test_page_screenshot_result_field_is_path_not_output(monkeypatch, tmp_path) 
                 method="do",
                 params={
                     "action": "page-screenshot",
-                    "payload": {"profile": "default", "target_id": "t1"},
+                    "payload": {"profile": "default", "target_id": "t1", "base64": True},
                 },
             )
         )

@@ -82,6 +82,8 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
     "extension-disable": {"profile": "default", "ids": ["<extension-id>"]},
     "extension-reload": {"profile": "default"},
     "extension-search": {"profile": "default", "store": "edge", "query": "dark reader"},
+    "clipboard-read": {"profile": "default"},
+    "clipboard-write": {"profile": "default", "text": "hello"},
     "page-navigate": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -91,6 +93,7 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
     "page-back": {"profile": "default", "target_id": "<target-id>"},
     "page-forward": {"profile": "default", "target_id": "<target-id>"},
     "page-click": {"profile": "default", "target_id": "<target-id>", "selector": "#submit"},
+    "page-click-eval": {"profile": "default", "target_id": "<target-id>", "selector": "#submit"},
     "page-click-coordinates": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -474,6 +477,12 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
             }
         ],
     },
+    "clipboard-read": {
+        "text": "Copied text from OS clipboard",
+    },
+    "clipboard-write": {
+        "written": True,
+    },
     "page-navigate": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -484,6 +493,12 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
     "page-back": {"profile": "default", "target_id": "<target-id>", "navigated": True},
     "page-forward": {"profile": "default", "target_id": "<target-id>", "navigated": True},
     "page-click": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "selector": "#submit",
+        "clicked": True,
+    },
+    "page-click-eval": {
         "profile": "default",
         "target_id": "<target-id>",
         "selector": "#submit",

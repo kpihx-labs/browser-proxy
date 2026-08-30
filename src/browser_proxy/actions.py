@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import math
+import time
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -169,7 +170,7 @@ def _profile(payload: dict[str, Any], context: DaemonContext) -> tuple[str, CdpB
             f"PROFILE_UNAVAILABLE: {name} is declared but Edge has never started there — "
             "run profile-start first"
         )
-    return name, CdpBrowser(edge_cdp_port(name))
+    return name, CdpBrowser(edge_cdp_port(name), profile=name)
 
 
 async def _profile_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -2017,29 +2018,141 @@ async def _resolve_box(browser: CdpBrowser, target_id: str, selector: str) -> tu
     # `page_session()` calls was the exact bug; chaining them within ONE call (one attach, one
     # detach), each later call's params resolved from the earlier calls' real results via
     # `CdpParams`'s callable form, is the fix.
-    _, node, box = await browser.page_session(
-        target_id,
-        [
-            ("DOM.getDocument", {"depth": -1}),
-            (
-                "DOM.querySelector",
-                lambda results: {
-                    "nodeId": results[0].get("root", {}).get("nodeId"),
-                    "selector": selector,
-                },
-            ),
-            ("DOM.getBoxModel", lambda results: {"nodeId": results[1].get("nodeId", 0)}),
-        ],
-    )
-    node_id = node.get("nodeId", 0)
-    if not node_id:
-        raise ValueError(f"element not found: {selector}")
-    quad = box["model"]["content"]
+    if selector.startswith("xpath="):
+        xpath_query = selector[6:]
+        expr = f"document.evaluate({json.dumps(xpath_query)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
+        _, _evaluate, req_node, box = await browser.page_session(
+            target_id,
+            [
+                ("DOM.getDocument", {"depth": -1}),
+                ("Runtime.evaluate", {"expression": expr}),
+                (
+                    "DOM.requestNode",
+                    lambda results: {"objectId": results[1].get("result", {}).get("objectId", "")},
+                ),
+                ("DOM.getBoxModel", lambda results: {"nodeId": results[2].get("nodeId", 0)}),
+            ],
+        )
+        node_id = req_node.get("nodeId", 0)
+        if not node_id:
+            raise ValueError(f"element not found: {selector}")
+    else:
+        _, node, box = await browser.page_session(
+            target_id,
+            [
+                ("DOM.getDocument", {"depth": -1}),
+                (
+                    "DOM.querySelector",
+                    lambda results: {
+                        "nodeId": results[0].get("root", {}).get("nodeId"),
+                        "selector": selector,
+                    },
+                ),
+                ("DOM.getBoxModel", lambda results: {"nodeId": results[1].get("nodeId", 0)}),
+            ],
+        )
+        node_id = node.get("nodeId", 0)
+        if not node_id:
+            raise ValueError(f"element not found: {selector}")
+
+    quad = box.get("model", {}).get("content")
+    if not quad:
+        raise ValueError(f"element box model not available: {selector}")
     return (quad[0] + quad[4]) / 2, (quad[1] + quad[5]) / 2
 
 
+async def _resolve_box_with_fallback(
+    browser: CdpBrowser, target_id: str, selector: str, fallback_selector: str = ""
+) -> tuple[float, float, str]:
+    """Purpose: resolve a selector with a short retry loop, falling back to a secondary selector.
+
+    Args:
+        browser (CdpBrowser): Client.
+        target_id (str): Target.
+        selector (str): Primary selector.
+        fallback_selector (str): Fallback.
+
+    Returns:
+        tuple[float, float, str]: The coordinates and used selector.
+
+    Examples:
+        >>> asyncio.iscoroutinefunction(_resolve_box_with_fallback)
+        True
+        >>> callable(_resolve_box_with_fallback)
+        True
+    """
+    start = time.monotonic()
+    last_err = None
+    while time.monotonic() - start < 2.0:
+        try:
+            x, y = await _resolve_box(browser, target_id, selector)
+            return x, y, selector
+        except (ValueError, RuntimeError) as e:
+            last_err = e
+            await asyncio.sleep(0.5)
+
+    if fallback_selector:
+        try:
+            x, y = await _resolve_box(browser, target_id, fallback_selector)
+            return x, y, fallback_selector
+        except (ValueError, RuntimeError) as e:
+            raise ValueError(
+                f"element not found: {selector} (fallback {fallback_selector} also failed: {e})"
+            )
+    raise ValueError(f"element not found: {selector} (timeout 2.0s, last error: {last_err})")
+
+
+async def _resolve_box_eval(
+    browser: CdpBrowser, target_id: str, selector: str
+) -> tuple[float, float]:
+    """Purpose: resolve a CSS selector to its element center via a single atomic ``Runtime.evaluate`` call.
+
+    Args:
+        browser (CdpBrowser): Client.
+        target_id (str): Target page.
+        selector (str): CSS selector expected to match exactly one element.
+
+    Returns:
+        tuple[float, float]: Viewport ``(x, y)`` center of the matched element's content box.
+
+    Notes:
+        Unlike ``_resolve_box`` (which chains ``DOM.getDocument`` → ``DOM.querySelector`` →
+        ``DOM.getBoxModel`` in three separate CDP calls — a race on dynamic pages where the node
+        can vanish between ``querySelector`` and ``getBoxModel``), this helper executes the entire
+        query-and-measure sequence inside a single ``Runtime.evaluate`` — fully atomic from the
+        page's perspective.
+
+    Examples:
+        >>> asyncio.iscoroutinefunction(_resolve_box_eval)
+        True
+        >>> callable(_resolve_box_eval)
+        True
+    """
+    escaped = json.dumps(selector)
+    expr = (
+        f"(() => {{"
+        f"  const el = document.querySelector({escaped});"
+        f"  if (!el) return null;"
+        f"  const r = el.getBoundingClientRect();"
+        f"  return {{x: r.x + r.width / 2, y: r.y + r.height / 2}};"
+        f"}})()"
+    )
+    results = await browser.page_session(
+        target_id,
+        [("Runtime.evaluate", {"expression": expr, "returnByValue": True})],
+    )
+    value = results[0].get("result", {}).get("value") if results else None
+    if not value or not isinstance(value, dict):
+        raise ValueError(f"element not found: {selector}")
+    cx = value.get("x")
+    cy = value.get("y")
+    if cx is None or cy is None:
+        raise ValueError(f"element not found: {selector}")
+    return float(cx), float(cy)
+
+
 async def _page_click(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: click an Edge page element resolved by CSS selector.
+    """Purpose: click an Edge page element resolved by CSS selector via DOM CDP calls.
 
     Args:
         payload (dict[str, Any]): Profile, required ``target_id``, and required ``selector``.
@@ -2047,6 +2160,15 @@ async def _page_click(payload: dict[str, Any], context: DaemonContext) -> dict[s
 
     Returns:
         dict[str, Any]: Profile, target ID, selector, clicked coordinates, and click flag.
+
+    Notes:
+        Uses ``DOM.getDocument`` → ``DOM.querySelector`` → ``DOM.getBoxModel`` (three separate
+        CDP calls). On dynamic pages (React, Vue, SPAs), a race condition can cause
+        ``CDP_ERROR: Could not find node with given id`` when the element is removed between
+        ``querySelector`` and ``getBoxModel``. In that case, **use ``page-click-eval``** instead
+        — it resolves the bounding box atomically via ``Runtime.evaluate``, eliminating the race.
+        ``page-click`` remains necessary for: (1) ``xpath=`` selectors, (2) elements inside
+        Shadow DOM, (3) pages with strict CSP blocking ``eval()``.
 
     Examples:
         >>> _page_click.__name__
@@ -2057,9 +2179,78 @@ async def _page_click(payload: dict[str, Any], context: DaemonContext) -> dict[s
     name, browser = _profile(payload, context)
     target_id = str(payload.get("target_id", ""))
     selector = str(payload.get("selector", ""))
+    fallback_selector = str(payload.get("fallback_selector", ""))
     if not target_id or not selector:
         raise ValueError("target_id and selector are required")
-    center_x, center_y = await _resolve_box(browser, target_id, selector)
+    center_x, center_y, used_selector = await _resolve_box_with_fallback(
+        browser, target_id, selector, fallback_selector
+    )
+    await browser.page_session(
+        target_id,
+        [
+            ("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": center_x, "y": center_y}),
+            (
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mousePressed",
+                    "x": center_x,
+                    "y": center_y,
+                    "button": "left",
+                    "clickCount": 1,
+                },
+            ),
+            (
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseReleased",
+                    "x": center_x,
+                    "y": center_y,
+                    "button": "left",
+                    "clickCount": 1,
+                },
+            ),
+        ],
+    )
+    return {
+        "profile": name,
+        "target_id": target_id,
+        "selector": used_selector,
+        "x": center_x,
+        "y": center_y,
+        "clicked": True,
+    }
+
+
+async def _page_click_eval(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: click an Edge page element resolved by CSS selector — **default choice** for page clicks.
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``target_id``, and required ``selector``.
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: Profile, target ID, selector, clicked coordinates, and click flag.
+
+    Notes:
+        **Default for CSS-selector page clicks.** Resolves the element's bounding box inside a
+        single ``Runtime.evaluate`` call (``querySelector`` + ``getBoundingClientRect`` execute
+        atomically from the page's perspective), eliminating the race condition that affects
+        ``page-click`` on dynamic pages (React, Vue, SPAs). Use ``page-click`` instead only when
+        you need: (1) ``xpath=`` selectors, (2) elements inside Shadow DOM, (3) pages with
+        strict CSP blocking ``eval()``.
+
+    Examples:
+        >>> _page_click_eval.__name__
+        '_page_click_eval'
+        >>> callable(_page_click_eval)
+        True
+    """
+    name, browser = _profile(payload, context)
+    target_id = str(payload.get("target_id", ""))
+    selector = str(payload.get("selector", ""))
+    if not target_id or not selector:
+        raise ValueError("target_id and selector are required")
+    center_x, center_y = await _resolve_box_eval(browser, target_id, selector)
     await browser.page_session(
         target_id,
         [
@@ -2204,9 +2395,12 @@ async def _page_hover(payload: dict[str, Any], context: DaemonContext) -> dict[s
     name, browser = _profile(payload, context)
     target_id = str(payload.get("target_id", ""))
     selector = str(payload.get("selector", ""))
+    fallback_selector = str(payload.get("fallback_selector", ""))
     if not target_id or not selector:
         raise ValueError("target_id and selector are required")
-    center_x, center_y = await _resolve_box(browser, target_id, selector)
+    center_x, center_y, used_selector = await _resolve_box_with_fallback(
+        browser, target_id, selector, fallback_selector
+    )
     await browser.page_session(
         target_id,
         [("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": center_x, "y": center_y})],
@@ -2214,7 +2408,7 @@ async def _page_hover(payload: dict[str, Any], context: DaemonContext) -> dict[s
     return {
         "profile": name,
         "target_id": target_id,
-        "selector": selector,
+        "selector": used_selector,
         "x": center_x,
         "y": center_y,
         "hovered": True,
@@ -2240,10 +2434,13 @@ async def _page_type(payload: dict[str, Any], context: DaemonContext) -> dict[st
     name, browser = _profile(payload, context)
     target_id = str(payload.get("target_id", ""))
     selector = str(payload.get("selector", ""))
+    fallback_selector = str(payload.get("fallback_selector", ""))
     text = str(payload.get("text", ""))
     if not target_id or not selector:
         raise ValueError("target_id and selector are required")
-    center_x, center_y = await _resolve_box(browser, target_id, selector)
+    center_x, center_y, used_selector = await _resolve_box_with_fallback(
+        browser, target_id, selector, fallback_selector
+    )
     calls: list[tuple[str, dict[str, Any]]] = [
         ("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": center_x, "y": center_y}),
         (
@@ -2268,11 +2465,11 @@ async def _page_type(payload: dict[str, Any], context: DaemonContext) -> dict[st
         ),
     ]
     if bool(payload.get("clear", False)):
-        clear_expression = f"document.querySelector({json.dumps(selector)}).value=''"
+        clear_expression = f"document.querySelector({json.dumps(used_selector)}).value=''"
         calls.append(("Runtime.evaluate", {"expression": clear_expression}))
     calls.append(("Input.insertText", {"text": text}))
     await browser.page_session(target_id, calls)
-    return {"profile": name, "target_id": target_id, "selector": selector, "typed": True}
+    return {"profile": name, "target_id": target_id, "selector": used_selector, "typed": True}
 
 
 async def _page_fill_form(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -2493,13 +2690,27 @@ async def _page_screenshot(payload: dict[str, Any], context: DaemonContext) -> d
     if not target_id:
         raise ValueError("target_id is required")
     image_format = str(payload.get("format", "png"))
+
+    repaint_expr = "document.body.style.transform = 'translateZ(0)';"
+
     result = await browser.page_session(
-        target_id, [("Page.captureScreenshot", {"format": image_format})]
+        target_id,
+        [
+            ("Runtime.evaluate", {"expression": repaint_expr}),
+            ("Page.captureScreenshot", {"format": image_format}),
+        ],
     )
-    data = str(result[0].get("data", ""))
+    data = str(result[1].get("data", ""))
+
     output = payload.get("output")
+    if not output and not payload.get("base64"):
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        output = f"/tmp/browser-proxy-results/screenshot_{timestamp}.png"
+
     if output:
-        Path(str(output)).write_bytes(base64.b64decode(data))
+        out_path = Path(str(output))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(base64.b64decode(data))
         return {"profile": name, "target_id": target_id, "path": str(output)}
     return {"profile": name, "target_id": target_id, "data": data}
 
@@ -3358,6 +3569,47 @@ async def _raw_page_bundle(payload: dict[str, Any], context: DaemonContext) -> d
     }
 
 
+async def _clipboard_read(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: read text from the system clipboard using the extension's background access.
+
+    Args:
+        payload (dict[str, Any]): Profile.
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: The clipboard text content.
+
+    Examples:
+        >>> _clipboard_read.__name__
+        '_clipboard_read'
+        >>> callable(_clipboard_read)
+        True
+    """
+    return await _extension(payload, context, "clipboard.read")
+
+
+@require_approval
+async def _clipboard_write(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: write text to the system clipboard using the extension's background access.
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``text``.
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Confirmed written flag.
+
+    Examples:
+        >>> _clipboard_write.__name__
+        '_clipboard_write'
+        >>> callable(_clipboard_write)
+        True
+    """
+    if "text" not in payload:
+        raise ValueError("clipboard-write requires 'text'")
+    return await _extension(payload, context, "clipboard.write")
+
+
 def _action(name: str, group: str, handler: Handler) -> ActionDef:
     """Purpose: construct a registry record from one documented action handler.
 
@@ -3409,11 +3661,14 @@ REGISTRY = {
         _action("extension-disable", "Extensions", _extension_disable),
         _action("extension-reload", "Extensions", _extension_reload),
         _action("extension-search", "Extensions", _extension_search),
+        _action("clipboard-read", "Advanced", _clipboard_read),
+        _action("clipboard-write", "Advanced", _clipboard_write),
         _action("page-navigate", "Navigation", _page_navigate),
         _action("page-reload", "Navigation", _page_reload),
         _action("page-back", "Navigation", _page_back),
         _action("page-forward", "Navigation", _page_forward),
         _action("page-click", "Interaction", _page_click),
+        _action("page-click-eval", "Interaction", _page_click_eval),
         _action("page-click-coordinates", "Interaction", _page_click_coordinates),
         _action("page-hover", "Interaction", _page_hover),
         _action("page-type", "Interaction", _page_type),
