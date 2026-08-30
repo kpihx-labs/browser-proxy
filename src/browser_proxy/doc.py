@@ -64,9 +64,25 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
             {"type": "group", "title": "Research", "tab_ids": [2, 3]},
         ],
     },
-    "bookmark-list": {"profile": "default"},
-    "bookmark-create": {"profile": "default", "title": "Example", "url": "https://example.com"},
-    "bookmark-remove": {"profile": "default", "id": "42"},
+    "bookmark-list": {"profile": "default", "depth": 1},
+    "bookmark-get": {"profile": "default", "id": "42"},
+    "bookmark-create": {
+        "profile": "default",
+        "items": [
+            {"type": "folder", "title": "2026", "ref": "y26"},
+            {
+                "type": "bookmark",
+                "title": "Example",
+                "url": "https://example.com",
+                "parent_ref": "y26",
+            },
+        ],
+    },
+    "bookmark-remove": {"profile": "default", "ids": ["7", "42"]},
+    "bookmark-update": {
+        "profile": "default",
+        "items": [{"id": "42", "title": "Renamed", "parent_id": "1"}],
+    },
     "page-navigate": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -294,9 +310,79 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
             {"type": "group", "group_id": 2, "tab_ids": [2, 3]},
         ]
     },
-    "bookmark-list": {"bookmarks": [{"id": "1", "title": "Favorites bar", "url": None}]},
-    "bookmark-create": {"id": "42", "title": "Example", "url": "https://example.com"},
-    "bookmark-remove": {"id": "42", "removed": True},
+    "bookmark-list": {
+        "depth": 1,
+        "roots": [
+            {
+                "id": "1",
+                "title": "Bookmarks bar",
+                "type": "folder",
+                "url": None,
+                "parent_id": "0",
+                "index": 0,
+                "children": [
+                    {
+                        "id": "42",
+                        "title": "Example",
+                        "type": "bookmark",
+                        "url": "https://example.com",
+                        "parent_id": "1",
+                        "index": 0,
+                    }
+                ],
+            }
+        ],
+    },
+    "bookmark-get": {
+        "id": "42",
+        "title": "Example",
+        "type": "bookmark",
+        "url": "https://example.com",
+        "parent_id": "1",
+        "parent_title": "Bookmarks bar",
+        "index": 0,
+        "date_added": 1700000000000,
+        "date_last_used": 1700000500000,
+    },
+    "bookmark-create": {
+        "created": [
+            {
+                "ref": "y26",
+                "id": "101",
+                "type": "folder",
+                "title": "2026",
+                "url": None,
+                "parent_id": "1",
+                "index": 0,
+            },
+            {
+                "ref": None,
+                "id": "102",
+                "type": "bookmark",
+                "title": "Example",
+                "url": "https://example.com",
+                "parent_id": "101",
+                "index": 0,
+            },
+        ]
+    },
+    "bookmark-remove": {
+        "removed": [
+            {"id": "7", "type": "folder", "title": "Old project", "url": None},
+            {"id": "42", "type": "bookmark", "title": "Example", "url": "https://example.com"},
+        ]
+    },
+    "bookmark-update": {
+        "updated": [
+            {
+                "id": "42",
+                "title": "Renamed",
+                "url": "https://example.com",
+                "parent_id": "1",
+                "index": 0,
+            }
+        ]
+    },
     "page-navigate": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -413,7 +499,6 @@ FIELD_NOTES: dict[str, str] = {
     "color": "Edge tab-group color.",
     "group_id": "Real numeric Edge tab-group ID.",
     "window_id": "Real numeric destination Edge window ID.",
-    "id": "Bookmark ID returned by `bookmark-list`.",
     "question": "Question rendered in the visible extension overlay.",
     "input_type": "`text` (default) or `password` input in the overlay.",
     "cells": "Optional CAPTCHA grid cell indexes; grid solving is not implemented.",
@@ -437,6 +522,19 @@ FIELD_NOTES: dict[str, str] = {
     "focused": "Whether the window should be given input focus.",
     "saves": 'Non-empty list of {"window_id":N,"name":str} — several windows saved in ONE call.',
     "names": "Non-empty list of saved window names — several restored/removed in ONE call.",
+    "ids": (
+        "Non-empty list of real bookmark/folder ids — several removed in ONE call, mixing "
+        "folders (removed WITH their subtree) and leaf bookmarks freely."
+    ),
+    "depth": (
+        "Non-negative integer capping how many levels below the top-level roots are "
+        "included; omitted or `null` returns the full tree, unbounded."
+    ),
+    "root_id": (
+        "Existing real bookmark folder id scoping the whole call to just that ONE subfolder "
+        "instead of the top-level roots; `depth` then counts from THAT folder."
+    ),
+    "items": "Ordered batch list of per-item objects — several created/updated in ONE call.",
 }
 
 OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
@@ -459,6 +557,7 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "browser-solve-captcha": ("cells",),
     "browser-drop-file": ("mime_type",),
     "browser-get-new-tab": ("timeout_seconds",),
+    "bookmark-list": ("depth", "root_id"),
 }
 
 ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
@@ -494,6 +593,18 @@ ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
         "browser-solve-captcha",
         "action",
     ): "`detect`, `click_checkbox`, or `click_grid` (grid solving is not implemented).",
+    ("bookmark-create", "items"): (
+        'Ordered batch list: {"type":"folder"|"bookmark","title","url"? (bookmark only),'
+        '"parent_id"? (existing folder),"parent_ref"? (an earlier folder item\'s ref, same '
+        'batch — mutually exclusive with parent_id),"ref"? (name later items may target),'
+        '"index"?} — several bookmarks/folders created in ONE call, never one call per item.'
+    ),
+    ("bookmark-update", "items"): (
+        'Ordered batch list: {"id","title"?,"url"? (bookmark only),"parent_id"?,"index"?} — at '
+        "least one field beyond id per item — several updates applied in ONE call, never one "
+        "call per item."
+    ),
+    ("bookmark-get", "id"): "Real bookmark or folder id to read ALL available information about.",
 }
 
 

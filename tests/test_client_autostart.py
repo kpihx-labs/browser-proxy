@@ -1,9 +1,18 @@
 """Client auto-start race-safety tests — no real socket, no real systemctl involved."""
 
 import asyncio
+import struct
 from typing import Any
 
 from browser_proxy import client
+
+
+def _framed(payload: bytes) -> bytes:
+    """Purpose: build one length-prefixed frame identical to the real `ipc.write_message` wire shape."""
+    return struct.pack("!Q", len(payload)) + payload
+
+
+_DEFAULT_ENVELOPE = b'{"meta":{"status":"ok","comment":"","edited":false},"data":{}}'
 
 
 class _FakeCompletedProcess:
@@ -16,10 +25,20 @@ class _FakeCompletedProcess:
 
 
 class _FakeReader:
-    """Purpose: hand back one valid `Envelope` JSON line, matching the daemon's real wire shape."""
+    """Purpose: hand back one valid framed `Envelope` response, matching the daemon's real
+    length-prefixed wire shape (see `browser_proxy.ipc`)."""
 
-    async def readline(self) -> bytes:
-        return b'{"meta":{"status":"ok","comment":"","edited":false},"data":{}}\n'
+    def __init__(self, payload: bytes = _DEFAULT_ENVELOPE) -> None:
+        self._buffer = _framed(payload)
+        self._pos = 0
+
+    async def readexactly(self, n: int) -> bytes:
+        end = self._pos + n
+        if end > len(self._buffer):
+            raise asyncio.IncompleteReadError(self._buffer[self._pos :], end - self._pos)
+        chunk = self._buffer[self._pos : end]
+        self._pos = end
+        return chunk
 
 
 class _FakeWriter:

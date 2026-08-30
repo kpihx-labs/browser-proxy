@@ -18,6 +18,7 @@ from browser_proxy.actions import (
 )
 from browser_proxy.bridge import ExtensionBridge
 from browser_proxy.cdp import CdpBrowser, is_read_only_method
+from browser_proxy import ipc
 from browser_proxy.models import Envelope, RpcRequest
 from browser_proxy.paths import (
     discover_edge_profiles,
@@ -186,7 +187,7 @@ class Daemon:
         raise RuntimeError("DAEMON_STOP")
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Purpose: handle one newline-delimited request on a local client connection.
+        """Purpose: handle one length-prefixed request on a local client connection.
 
         Args:
             self (Daemon): Daemon instance dispatching the validated request.
@@ -194,7 +195,8 @@ class Daemon:
             writer (asyncio.StreamWriter): Connected local client's response stream.
 
         Returns:
-            None: Writes one complete JSON envelope before closing the connection.
+            None: Writes one complete, length-prefixed JSON envelope before closing the
+            connection — never truncated, regardless of how large the result is (see ``ipc.py``).
 
         Examples:
             >>> asyncio.iscoroutinefunction(Daemon._handle)
@@ -203,14 +205,13 @@ class Daemon:
             True
         """
         try:
-            raw = await asyncio.wait_for(reader.readline(), timeout=10)
+            raw = await asyncio.wait_for(ipc.read_message(reader), timeout=10)
             if not raw:
                 raise ValueError("empty request")
             envelope = await self.dispatch(RpcRequest.model_validate_json(raw))
-        except (ValueError, OSError, UnicodeDecodeError) as error:
+        except (ValueError, OSError, UnicodeDecodeError, ConnectionError) as error:
             envelope = Envelope.error("VALIDATION_ERROR", message=str(error))
-        writer.write((envelope.model_dump_json() + "\n").encode())
-        await writer.drain()
+        await ipc.write_message(writer, envelope.model_dump_json().encode())
         writer.close()
         await writer.wait_closed()
 

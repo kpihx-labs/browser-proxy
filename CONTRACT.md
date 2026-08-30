@@ -270,13 +270,20 @@ profiles → windows → tabs → tab groups.
 | `group-remove-tabs` | bridge kind `group.remove_tabs` — see `## Canonical tab/group structure` | ✅ preflight `tab_ids` | ungroups without closing — now gated (KπX directive, GRAVÉ reversal) |
 | `group-sync` | bridge kind `group.sync` — see `## Moving and regrouping tabs` | ✅ preflight `layout` | reorganizes a WHOLE window's tab/group structure in one call — now gated (KπX directive, GRAVÉ reversal) |
 
-#### Bookmarks (extension-mediated)
+#### Bookmarks (extension-mediated) — filesystem-like tree, full batch flexibility
+
+Edge bookmarks are a real folder/subfolder hierarchy (`Bookmarks bar`/`Other bookmarks`/`Mobile
+bookmarks` as top-level roots, folders nestable arbitrarily deep) — this surface reveals and
+mutates that REAL structure, never a flat dump, and every mutating action is batch-first: several
+bookmarks/folders created, removed, or updated in ONE call, never one call per item.
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `bookmark-list` | bridge kind `bookmark.list` | ❌ | |
-| `bookmark-create` | bridge kind `bookmark.create` | ✅ verify `url` | |
-| `bookmark-remove` | bridge kind `bookmark.remove` | ✅ preflight `id` | |
+| `bookmark-list` | bridge kind `bookmark.list`, `chrome.bookmarks.getTree()` (or `getSubTree(root_id)` when scoped) walked into a real nested tree | ❌ | `{depth?, roots: [...]}` — the invisible super-root (`"0"`) is never itself returned, `roots` starts at its real children; each node carries `id`/`title`/`type` (`"folder"`\|`"bookmark"`)/`url`/`parent_id`/`index`, and, for folders only, a real `children` list. `depth` (optional, non-negative int) caps how many levels below the roots are included — omitted/`null` returns the full tree, unbounded; `depth:0` returns only the roots with empty `children`. `root_id` (optional, existing real folder id) scopes the WHOLE call to just that one subfolder (via `getSubTree`) instead of the top-level roots — `depth` then counts from THAT folder; `roots` stays a single-element list either way, never a special-cased singular field |
+| `bookmark-get` | bridge kind `bookmark.get`, `chrome.bookmarks.get(id)` + `getSubTree(id)` (folders only, for the preview) | ❌ | read ALL available info about ONE id in one call (same philosophy as `tab-get`): `{id, title, type, url, parent_id, parent_title, index, date_added}` always, plus for a folder `{date_group_modified, children_count, children_preview:{first,last}\|null}`, or for a leaf bookmark `date_last_used` instead — never the full subtree (use `bookmark-list` with `root_id` for that) |
+| `bookmark-create` | bridge kind `bookmark.create` | ✅ preflight `items` | batch: `items` is an ORDERED list of `{"type":"folder"\|"bookmark","title","url"? (bookmark only),"parent_id"? (existing real folder),"parent_ref"? (an EARLIER folder item's local `ref` in the SAME batch — mutually exclusive with `parent_id`),"ref"? (a local name later items may target),"index"?}`; a folder created earlier in the batch can be filled immediately via `parent_ref`, zero extra round trip. Not atomic (documented) — a failure partway leaves earlier creations in place |
+| `bookmark-remove` | bridge kind `bookmark.remove` | ✅ preflight `ids` | batch: `ids` is a non-empty list mixing folder AND leaf bookmark identifiers freely in the SAME call — a folder id is removed WITH its whole subtree (`chrome.bookmarks.removeTree`), a leaf id alone (`chrome.bookmarks.remove`). Every id is resolved BEFORE any removal happens — an unknown id anywhere in the batch removes NOTHING (all-or-nothing identity) |
+| `bookmark-update` | bridge kind `bookmark.update` | ✅ preflight `items` | batch, fine-grained: `items` is a list of `{"id","title"?,"url"? (bookmark only),"parent_id"?,"index"?}` — any subset of rename/re-url/relocate/reposition per item, at least one field beyond `id` required (a no-op item is rejected). Every id is resolved BEFORE any mutation happens — an unknown id, or a `url` given for an id that is actually a folder, rejects the WHOLE call |
 
 #### Navigation
 
@@ -620,7 +627,8 @@ per-action tables above for the exact list). The flow, matching `Daemon._approve
 6. Extension shows a closed-shadow-root overlay in the paired Edge window: scopes + real non-secret
    `details` (raw fields, ANY array-of-strings field rendered one line per element) PLUS
    `describeNativeReferences()`'s resolved illustrations for `group_id`/`window_id`/`tab_ids`/
-   `layout`/bookmark `id` (real title/url/name, never opaque ids alone) — never raw secrets —
+   `layout`/bookmark `ids`/`items[].id`/`items[].parent_id` (real title/url/name, never opaque ids
+   alone) — never raw secrets —
    Approve once / Deny
 7. Extension replies {"decision": "approved"|"rejected"|"timeout", "comment": "...",
      "payload": <possibly edited>} — or, if delivery itself failed (no valid tab could ever host

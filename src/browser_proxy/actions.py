@@ -1384,14 +1384,26 @@ async def _extension(payload: dict[str, Any], context: DaemonContext, kind: str)
 
 
 async def _bookmark_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: list Edge profile bookmarks through the paired privileged extension.
+    """Purpose: reveal the REAL Edge bookmark folder/subfolder tree, filesystem-like, through the
+    paired privileged extension (KπX, GRAVÉ: "les bookmarks sont carrément comme un système de
+    fichier avec dossier sous dossier... le list doit bien révéler cela").
 
     Args:
-        payload (dict[str, Any]): Object identifying the Edge profile to inspect.
+        payload (dict[str, Any]): Profile, optional ``depth`` (int, non-negative, or ``None``)
+            capping how many levels below the returned roots are included — omitted or ``None``
+            returns the full tree, unbounded — and optional ``root_id`` (an existing real folder
+            id) scoping the WHOLE call to just that one subfolder instead of the top-level roots
+            (``Bookmarks bar``/``Other bookmarks``/``Mobile bookmarks``); ``depth`` then counts
+            from THAT folder.
         context (DaemonContext): Daemon state exposing the paired extension.
 
     Returns:
-        dict[str, Any]: Profile-scoped bookmark tree supplied by the extension.
+        dict[str, Any]: ``{depth, roots: [...]}`` — a real nested tree (never a flat dump); each
+        node carries ``id``, ``title``, ``type`` (``"folder"``/``"bookmark"``), ``url``,
+        ``parent_id``, ``index``, and, for folders only, a real ``children`` list (possibly empty
+        once ``depth`` truncates it). Without ``root_id``, ``roots`` holds the top-level folders;
+        with ``root_id``, ``roots`` is a single-element list holding just that one requested
+        folder — kept as a list either way, so callers never special-case the two modes.
 
     Examples:
         >>> _bookmark_list.__name__
@@ -1402,17 +1414,50 @@ async def _bookmark_list(payload: dict[str, Any], context: DaemonContext) -> dic
     return await _extension(payload, context, "bookmark.list")
 
 
-@require_approval
-@require_verification("url")
-async def _bookmark_create(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: create an Edge profile bookmark through the paired extension.
+async def _bookmark_get(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: read ALL available real information about ONE bookmark or folder in a single
+    call, through the paired extension — same "everything about ONE X" philosophy as ``tab-get``,
+    extended to bookmarks (KπX, GRAVÉ: "un truc bookmark-get qui affiche toutes les infos sur un
+    bookmark donné").
 
     Args:
-        payload (dict[str, Any]): Profile bookmark data including a URL to save.
+        payload (dict[str, Any]): Profile and required ``id`` (a real bookmark or folder id).
         context (DaemonContext): Daemon state exposing the paired extension.
 
     Returns:
-        dict[str, Any]: Extension-confirmed created bookmark information.
+        dict[str, Any]: Extension-confirmed ``{id, title, type, url, parent_id, parent_title,
+        index, date_added}`` always, plus, for a folder, ``{date_group_modified, children_count,
+        children_preview: {first, last}|None}``; for a leaf bookmark, ``date_last_used`` instead —
+        never the full subtree (see ``bookmark-list`` for that).
+
+    Examples:
+        >>> _bookmark_get.__name__
+        '_bookmark_get'
+        >>> callable(_bookmark_get)
+        True
+    """
+    return await _extension(payload, context, "bookmark.get")
+
+
+@require_approval
+@require_preflight("items")
+async def _bookmark_create(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: create one or MORE real bookmarks/folders through the paired extension, batch, in
+    ONE call, with absolute placement finesse (KπX, GRAVÉ: "le create doit vraiment permettre de
+    bien placer ds ce système... être lancé en batch, faire plusieurs d'un coup").
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty ``items``: an ORDERED list of
+            ``{"type": "folder"|"bookmark", "title", "url"? (bookmark only), "parent_id"?
+            (an existing real folder id), "parent_ref"? (a LOCAL ref naming an EARLIER folder item
+            in this SAME batch — mutually exclusive with ``parent_id``), "ref"? (a LOCAL name later
+            items may target via their own ``parent_ref``), "index"?}`` — several bookmarks/folders
+            created in ONE call, never one call per item.
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{created: [{ref, id, type, title, url, parent_id,
+        index}, ...]}``, one entry per input item, same order.
 
     Examples:
         >>> _bookmark_create.__name__
@@ -1424,16 +1469,21 @@ async def _bookmark_create(payload: dict[str, Any], context: DaemonContext) -> d
 
 
 @require_approval
-@require_preflight("id")
+@require_preflight("ids")
 async def _bookmark_remove(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: remove an Edge profile bookmark through the paired extension.
+    """Purpose: permanently remove one or MORE real bookmarks/folders through the paired
+    extension, batch, in ONE call — mixing a whole folder (removed WITH its subtree) and a
+    standalone leaf bookmark in the SAME call is deliberate (KπX, GRAVÉ: "on peut supprimer de
+    dossier sous dossier juste et élément").
 
     Args:
-        payload (dict[str, Any]): Profile bookmark data including required bookmark ``id``.
+        payload (dict[str, Any]): Profile and required, non-empty ``ids``: real bookmark or folder
+            identifiers, in any mix, several removed in ONE call, never one call per id.
         context (DaemonContext): Daemon state exposing the paired extension.
 
     Returns:
-        dict[str, Any]: Extension-confirmed bookmark removal information.
+        dict[str, Any]: Extension-confirmed ``{removed: [{id, type, title, url}, ...]}`` — the real
+        identity of every removed node, never a bare id echoed back blind.
 
     Examples:
         >>> _bookmark_remove.__name__
@@ -1442,6 +1492,34 @@ async def _bookmark_remove(payload: dict[str, Any], context: DaemonContext) -> d
         True
     """
     return await _extension(payload, context, "bookmark.remove")
+
+
+@require_approval
+@require_preflight("items")
+async def _bookmark_update(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: the ONE fine-grained way to change anything about one or MORE existing real
+    bookmarks/folders through the paired extension — rename, change url, relocate to a different
+    folder, and/or reposition — any subset, batch, in ONE call (KπX, GRAVÉ: same "absolute finesse"
+    philosophy as ``tab-update``, extended to bookmarks).
+
+    Args:
+        payload (dict[str, Any]): Profile and required, non-empty ``items``: a list of
+            ``{"id", "title"?, "url"? (bookmark only), "parent_id"?, "index"?}`` — at least one
+            field beyond ``id`` required per item (a no-op item is rejected), several updates
+            applied in ONE call, never one call per item.
+        context (DaemonContext): Daemon state exposing the paired extension.
+
+    Returns:
+        dict[str, Any]: Extension-confirmed ``{updated: [{id, title, url, parent_id, index}, ...]}``
+        — each entry reflecting that node's REAL state after every requested change.
+
+    Examples:
+        >>> _bookmark_update.__name__
+        '_bookmark_update'
+        >>> callable(_bookmark_update)
+        True
+    """
+    return await _extension(payload, context, "bookmark.update")
 
 
 async def _page_navigate(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -2658,8 +2736,10 @@ REGISTRY = {
         _action("tab-update", "Tabs", _tab_update),
         _action("group-list", "Groups", _group_list),
         _action("bookmark-list", "Bookmarks", _bookmark_list),
+        _action("bookmark-get", "Bookmarks", _bookmark_get),
         _action("bookmark-create", "Bookmarks", _bookmark_create),
         _action("bookmark-remove", "Bookmarks", _bookmark_remove),
+        _action("bookmark-update", "Bookmarks", _bookmark_update),
         _action("page-navigate", "Navigation", _page_navigate),
         _action("page-reload", "Navigation", _page_reload),
         _action("page-back", "Navigation", _page_back),

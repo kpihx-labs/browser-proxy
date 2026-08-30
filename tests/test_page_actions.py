@@ -52,8 +52,21 @@ def test_all_new_page_actions_are_registered() -> None:
     # 50 (profile-remove refonte) + tab-move + group-add-tabs + group-remove-tabs + group-sync
     # (tab/group refonte) = 54; -2 (page-list/page-get purged) +4 (tab-get, window-sync,
     # tab-move renamed tab-update so net 0) +4 (window-save/restore/saved-list/saved-remove) = 58;
-    # -1 (workspace-list removed: Edge has no supported Workspace API) = 57.
-    assert len(REGISTRY) == 57
+    # -1 (workspace-list removed: Edge has no supported Workspace API) = 57;
+    # +1 (bookmark-update: new fine-grained batch rename/re-url/move/reposition action) = 58;
+    # +1 (bookmark-get: read ALL info about ONE bookmark/folder, same philosophy as tab-get) = 59.
+    assert len(REGISTRY) == 59
+
+
+def test_bookmark_get_and_list_root_id_are_read_only_thin_extension_passthroughs() -> None:
+    """`bookmark-get`/`bookmark-list` are read-only, never approval-gated — same rationale as
+    `tab-get`/`window-list` — and both dispatch to `_extension()` unchanged (the real tree-walk,
+    root_id scoping, and children-preview logic all live in the paired extension, see the
+    TypeScript test suite for that coverage)."""
+    for name in ("bookmark-get", "bookmark-list"):
+        policy = REGISTRY[name].policy
+        assert policy.approval is False, name
+        assert policy.preflight_fields == (), name
 
 
 def _daemon_with_profile(tmp_path, monkeypatch) -> Daemon:

@@ -25,6 +25,7 @@ ENV_EDGE_PATH = "BROWSER_PROXY_EDGE_PATH"
 ENV_AUTOSAVE_DIR = "BROWSER_PROXY_AUTOSAVE_DIR"
 ENV_PREVIEW_LINES = "BROWSER_PROXY_PREVIEW_LINES"
 ENV_HITL_TIMEOUT_SECONDS = "BROWSER_PROXY_HITL_TIMEOUT_SECONDS"
+ENV_IPC_MAX_MESSAGE_BYTES = "BROWSER_PROXY_IPC_MAX_MESSAGE_BYTES"
 
 # --- Default values ---
 EXTENSION_PORT_DEFAULT = 37291
@@ -65,3 +66,14 @@ EDGE_PROFILE_MARKER_FILENAME = "Local State"
 against it — verified live against 3 real browser-proxy profile directories. Its presence is the
 single authoritative signal that a directory is a genuine Edge-initialized profile rather than one
 merely declared/`mkdir`'d by browser-proxy itself (see ``paths.edge_profile_state``)."""
+
+IPC_MAX_MESSAGE_BYTES_DEFAULT = 64 * 1024 * 1024
+"""Ceiling for one length-prefixed client<->daemon IPC message body (see ``ipc.py``). The Unix
+socket transport used to be one JSON line terminated by ``\\n``, read via ``readline()`` — bounded
+by asyncio's internal ~64 KiB line buffer (``LimitOverrunError``, surfaced to users as the raw wire
+message ``Separator is found, but chunk is longer than limit``). A genuinely large single-page
+result (e.g. ``page-snapshot``'s full accessibility tree) routinely exceeded that ceiling before
+the CLI's own preview/autosave truncation ever got a chance to run. 64 MiB is generous headroom
+for any legitimate single-page CDP result while still bounding memory against a malformed or
+hostile length prefix — this daemon is reachable only via a same-user Unix socket, never a network
+listener, so the bound exists for correctness/memory-safety, not as a network hardening control."""

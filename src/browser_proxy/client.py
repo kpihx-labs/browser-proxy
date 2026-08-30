@@ -13,6 +13,7 @@ import subprocess
 import uuid
 from typing import Any
 
+from browser_proxy import ipc
 from browser_proxy.models import Envelope
 from browser_proxy.paths import socket_path
 
@@ -65,7 +66,10 @@ async def request(method: str, params: dict[str, Any]) -> Envelope:
         params (dict[str, Any]): JSON object for that method.
 
     Returns:
-        The daemon's validated response envelope.
+        The daemon's validated response envelope. A transport failure while reading a
+        length-prefixed response (peer closed early, or an announced length beyond
+        ``ipc.max_message_bytes()``) is reported as an ``IPC_ERROR`` envelope, never an uncaught
+        exception reaching the CLI's own output.
 
     Examples:
         >>> asyncio.iscoroutinefunction(request)
@@ -91,11 +95,15 @@ async def request(method: str, params: dict[str, Any]) -> Envelope:
             return Envelope.error(
                 "DAEMON_UNAVAILABLE", message="systemd daemon did not become ready"
             )
-    writer.write(
-        (json.dumps({"id": str(uuid.uuid4()), "method": method, "params": params}) + "\n").encode()
+    await ipc.write_message(
+        writer, json.dumps({"id": str(uuid.uuid4()), "method": method, "params": params}).encode()
     )
-    await writer.drain()
-    response = await reader.readline()
+    try:
+        response = await ipc.read_message(reader)
+    except (ConnectionError, ValueError) as error:
+        writer.close()
+        await writer.wait_closed()
+        return Envelope.error("IPC_ERROR", message=str(error))
     writer.close()
     await writer.wait_closed()
     return Envelope.model_validate_json(response)
