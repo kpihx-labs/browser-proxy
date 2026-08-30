@@ -15,6 +15,7 @@ NEW_ACTIONS = (
     "page-back",
     "page-forward",
     "page-click",
+    "page-click-coordinates",
     "page-hover",
     "page-type",
     "page-fill-form",
@@ -32,6 +33,8 @@ NEW_ACTIONS = (
     "cookie-remove",
     "storage-local-get",
     "storage-local-set",
+    "storage-local-remove",
+    "storage-local-clear",
     "group-create",
     "group-update",
     "group-move",
@@ -59,8 +62,12 @@ def test_all_new_page_actions_are_registered() -> None:
     # implemented, live-verified Chrome platform restriction, see CONTRACT.md) = 65;
     # -1 (group-sync purged: window-sync without bounds/state/focused is a strict superset of
     # what it did — KπX, GRAVÉ "purge group-sync vu que inclus ds window-sync") = 64;
-    # -1 (page-set-download-behavior purged, unused/classic ~/Downloads is enough) = 63.
-    assert len(REGISTRY) == 63
+    # -1 (page-set-download-behavior purged, unused/classic ~/Downloads is enough) = 63;
+    # +1 (page-click-coordinates: click at explicit viewport coordinates via page-scoped CDP —
+    # reachs a cross-origin iframe no selector can address) = 64;
+    # +2 (storage-local-remove/storage-local-clear: completes the symmetric storage/cookie action
+    # pair — live-verified `getItem`/`setItem` had no `removeItem`/`clear` counterpart) = 66.
+    assert len(REGISTRY) == 66
     assert "group-sync" not in REGISTRY
 
 
@@ -940,6 +947,84 @@ def test_page_evaluate_runs_read_only_without_approval(monkeypatch, tmp_path) ->
     assert not REGISTRY["page-evaluate"].policy.approval
 
 
+def test_page_evaluate_falls_back_gracefully_on_non_serializable_result(
+    monkeypatch, tmp_path
+) -> None:
+    """``page-evaluate`` retries without ``returnByValue`` and returns a safe description instead
+    of crashing when the expression evaluates to a non-JSON-serializable value (e.g.
+    `window.open(...)` returns a circular-reference `Window` object — live-verified: CDP always
+    raises `CDP_ERROR: Object reference chain is too long` under `returnByValue: true`)."""
+    calls: list[tuple[str, list[tuple[str, dict[str, Any]]]]] = []
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        calls.append((target_id, session_calls))
+        _method, params = session_calls[0]
+        if params.get("returnByValue"):
+            raise RuntimeError("CDP_ERROR: Object reference chain is too long")
+        return [{"result": {"type": "object", "description": "Window"}}]
+
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "page-evaluate",
+                    "payload": {
+                        "profile": "default",
+                        "target_id": "target-1",
+                        "expression": "window.open('https://example.org')",
+                    },
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data["result"] == "Window"
+    assert len(calls) == 2
+    assert calls[0][1][0][1]["returnByValue"] is True
+    assert "returnByValue" not in calls[1][1][0][1]
+
+
+def test_page_evaluate_reraises_unrelated_runtime_errors(monkeypatch, tmp_path) -> None:
+    """A genuinely unrelated CDP failure is never silently swallowed by the serialization
+    fallback — only the exact `Object reference chain is too long` message is caught."""
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("CDP_ERROR: some unrelated failure")
+
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "page-evaluate",
+                    "payload": {
+                        "profile": "default",
+                        "target_id": "target-1",
+                        "expression": "1 + 1",
+                    },
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "error"
+    assert result.data["code"] == "CDP_ERROR"
+
+
 def test_page_click_resolves_box_then_dispatches_mouse_events(monkeypatch, tmp_path) -> None:
     """``page-click`` resolves an element's box (via ONE bundled `page_session` call — never 3
     separate ones, the exact bug root-caused live: `DOM.getDocument`'s `nodeId`s do not survive a
@@ -1004,6 +1089,229 @@ def test_page_click_resolves_box_then_dispatches_mouse_events(monkeypatch, tmp_p
     ]
     mouse_methods = [method for method, _ in calls[1]]
     assert mouse_methods == ["Input.dispatchMouseEvent"] * 3
+
+
+def test_page_click_coordinates_dispatches_mouse_events_at_coordinates(
+    monkeypatch, tmp_path
+) -> None:
+    """``page-click-coordinates`` dispatches the SAME page-scoped mouse-event sequence as
+    ``page-click`` but at caller-provided viewport coordinates — one bundled `page_session`
+    call, three `Input.dispatchMouseEvent` events (moved/pressed/released) at the exact x/y,
+    never a DOM resolution step (a cross-origin iframe such as a reCAPTCHA widget has no
+    parent-page selector to resolve)."""
+    calls: list[tuple[str, list[tuple[str, dict[str, Any]]]]] = []
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        calls.append((target_id, session_calls))
+        return [{}] * len(session_calls)
+
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "page-click-coordinates",
+                    "payload": {
+                        "profile": "default",
+                        "target_id": "target-1",
+                        "x": 91.5,
+                        "y": 312.3,
+                    },
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data == {
+        "profile": "default",
+        "target_id": "target-1",
+        "x": 91.5,
+        "y": 312.3,
+        "button": "left",
+        "click_count": 1,
+        "clicked": True,
+    }
+    target_id, session_calls = calls[0]
+    assert target_id == "target-1"
+    assert [method for method, _ in session_calls] == ["Input.dispatchMouseEvent"] * 3
+    moved, pressed, released = [params for _, params in session_calls]
+    assert moved == {"type": "mouseMoved", "x": 91.5, "y": 312.3}
+    assert pressed == {
+        "type": "mousePressed",
+        "x": 91.5,
+        "y": 312.3,
+        "button": "left",
+        "clickCount": 1,
+    }
+    assert released == {
+        "type": "mouseReleased",
+        "x": 91.5,
+        "y": 312.3,
+        "button": "left",
+        "clickCount": 1,
+    }
+    assert not REGISTRY["page-click-coordinates"].policy.approval
+
+
+def test_page_click_coordinates_double_click_escalates_click_count(monkeypatch, tmp_path) -> None:
+    """``click_count: 2`` emits mouseMoved once then TWO press/release pairs whose ``clickCount``
+    escalates 1, 2 — the exact CDP shape a real double-click produces, so pages relying on the
+    native ``dblclick`` event fire correctly."""
+    calls: list[list[tuple[str, dict[str, Any]]]] = []
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        calls.append(session_calls)
+        return [{}] * len(session_calls)
+
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "page-click-coordinates",
+                    "payload": {
+                        "profile": "default",
+                        "target_id": "target-1",
+                        "x": 10,
+                        "y": 20,
+                        "click_count": 2,
+                    },
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data["button"] == "left"
+    assert result.data["click_count"] == 2
+    session_calls = calls[0]
+    # mouseMoved once + (pressed, released) twice = 5 events in ONE bundled session.
+    assert len(session_calls) == 5
+    assert [method for method, _ in session_calls] == ["Input.dispatchMouseEvent"] * 5
+    assert session_calls[0][1] == {"type": "mouseMoved", "x": 10, "y": 20}
+    pressed_counts = [
+        params["clickCount"]
+        for method, params in session_calls
+        if params.get("type") == "mousePressed"
+    ]
+    released_counts = [
+        params["clickCount"]
+        for method, params in session_calls
+        if params.get("type") == "mouseReleased"
+    ]
+    assert pressed_counts == [1, 2]
+    assert released_counts == [1, 2]
+    for method, params in session_calls[1:]:
+        assert params["button"] == "left"
+
+
+def test_page_click_coordinates_right_click_uses_right_button(monkeypatch, tmp_path) -> None:
+    """``button: right`` propagates through every press/release — a context-menu trigger CDP
+    delivers to the page, never a silently ignored field."""
+    calls: list[list[tuple[str, dict[str, Any]]]] = []
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        calls.append(session_calls)
+        return [{}] * len(session_calls)
+
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "page-click-coordinates",
+                    "payload": {
+                        "profile": "default",
+                        "target_id": "target-1",
+                        "x": 50,
+                        "y": 60,
+                        "button": "right",
+                    },
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data["button"] == "right"
+    assert result.data["click_count"] == 1
+    session_calls = calls[0]
+    assert len(session_calls) == 3
+    for method, params in session_calls[1:]:
+        assert params["button"] == "right"
+    assert session_calls[1][1]["clickCount"] == 1
+
+
+def test_page_click_coordinates_rejects_invalid_button_and_click_count(
+    monkeypatch, tmp_path
+) -> None:
+    """``button`` outside the CDP set and non-positive/non-integer ``click_count`` fail closed
+    with VALIDATION_ERROR — never a silently defaulted or truncated click."""
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    for bad_payload in (
+        {"profile": "default", "target_id": "target-1", "x": 5, "y": 5, "button": "turbo"},
+        {"profile": "default", "target_id": "target-1", "x": 5, "y": 5, "click_count": 0},
+        {"profile": "default", "target_id": "target-1", "x": 5, "y": 5, "click_count": -2},
+        {"profile": "default", "target_id": "target-1", "x": 5, "y": 5, "click_count": 1.5},
+    ):
+        result = asyncio.run(
+            daemon.dispatch(
+                RpcRequest(
+                    id="1",
+                    method="do",
+                    params={"action": "page-click-coordinates", "payload": bad_payload},
+                )
+            )
+        )
+        assert result.meta.status == "error", bad_payload
+        assert result.data["code"] == "VALIDATION_ERROR", bad_payload
+
+
+def test_page_click_coordinates_rejects_missing_or_non_numeric_coordinates(
+    monkeypatch, tmp_path
+) -> None:
+    """``page-click-coordinates`` fails closed with VALIDATION_ERROR when coordinates are
+    absent or non-numeric — never a silent 0,0 click at the top-left corner."""
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    for bad_payload in (
+        {"profile": "default", "target_id": "target-1"},
+        {"profile": "default", "target_id": "target-1", "x": 5},
+        {"profile": "default", "target_id": "target-1", "y": 5},
+        {"profile": "default", "target_id": "target-1", "x": "NaN", "y": 5},
+        {"profile": "default", "target_id": "target-1", "x": 5, "y": None},
+    ):
+        result = asyncio.run(
+            daemon.dispatch(
+                RpcRequest(
+                    id="1",
+                    method="do",
+                    params={"action": "page-click-coordinates", "payload": bad_payload},
+                )
+            )
+        )
+        assert result.meta.status == "error", bad_payload
+        assert result.data["code"] == "VALIDATION_ERROR", bad_payload
 
 
 def test_page_fill_form_embeds_field_map_and_returns_count(monkeypatch, tmp_path) -> None:
@@ -1084,15 +1392,74 @@ def test_cookie_set_is_approval_gated_before_reaching_cdp(monkeypatch, tmp_path)
     assert approvals[0]["action"] == "cookie-set"
     assert cdp_calls == [
         (
-            "Network.setCookie",
+            "Storage.setCookies",
             {
-                "name": "session",
-                "value": "abc",
-                "domain": "example.test",
-                "path": "/",
-                "secure": True,
-                "httpOnly": False,
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "abc",
+                        "domain": "example.test",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                        "url": "https://example.test/",
+                    }
+                ]
             },
+        )
+    ]
+
+
+def test_cookie_remove_uses_page_session_on_first_live_target(monkeypatch, tmp_path) -> None:
+    """``cookie-remove`` calls `Network.deleteCookies` through a page session (browser-level
+    `Network.*`/`Storage.deleteCookies` do not exist — live-verified method by method). Mocks the
+    REAL raw `Target.getTargets` shape (`targetId`, never `id` — KπX, GRAVÉ: the prior mock used
+    `id` here, matching a real `KeyError` bug in the handler instead of catching it)."""
+    approvals: list[dict[str, Any]] = []
+    session_calls: list[tuple[str, list[tuple[str, dict[str, Any]]]]] = []
+
+    async def targets(self: CdpBrowser) -> list[dict[str, Any]]:
+        return [
+            {"targetId": "TARGET-1", "type": "page"},
+            {"targetId": "TARGET-2", "type": "page"},
+        ]
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        session_calls.append((target_id, calls))
+        return [{}]
+
+    async def approve(
+        self: Daemon, action: str, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], str, bool]:
+        approvals.append({"action": action, "payload": payload})
+        return payload, "approved in test", False
+
+    monkeypatch.setattr(CdpBrowser, "targets", targets)
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    monkeypatch.setattr(Daemon, "_approve", approve)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "cookie-remove",
+                    "payload": {"profile": "default", "name": "session", "domain": "example.test"},
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert len(approvals) == 1
+    assert session_calls == [
+        (
+            "TARGET-1",
+            [("Network.deleteCookies", {"name": "session", "domain": "example.test"})],
         )
     ]
 
@@ -1127,6 +1494,148 @@ def test_browser_ask_user_forwards_to_extension_bridge(monkeypatch, tmp_path) ->
     assert result.data == {"answer": "yes", "profile": "default"}
     assert requests == [("user.ask", {"profile": "default", "question": "Continue?"}, "default")]
     assert not REGISTRY["browser-ask-user"].policy.approval
+
+
+def test_browser_solve_captcha_escalates_click_checkbox_to_a_real_cdp_coordinate_click(
+    monkeypatch, tmp_path
+) -> None:
+    """``browser-solve-captcha``'s ``click_checkbox`` escalates the extension-reported iframe
+    ``rect``/``url`` to a REAL ``Input.dispatchMouseEvent`` sequence (KπX, GRAVÉ: a content-script
+    click on a genuinely cross-origin reCAPTCHA iframe never reaches the checkbox — live-verified
+    against the official Google demo)."""
+    session_calls: list[tuple[str, list[tuple[str, dict[str, Any]]]]] = []
+
+    async def extension_request(
+        self: Daemon, kind: str, payload: dict[str, Any], profile: str
+    ) -> dict[str, Any]:
+        assert kind == "captcha.solve"
+        return {
+            "detected": True,
+            "clicked": False,
+            "reason": "reported iframe rect for CDP-level coordinate click",
+            "rect": {"left": 10.0, "top": 20.0, "width": 304.0, "height": 78.0},
+            "url": "https://example.com/",
+        }
+
+    async def targets(self: CdpBrowser) -> list[dict[str, Any]]:
+        return [
+            {"targetId": "OTHER-TAB", "type": "page", "url": "https://unrelated.example/"},
+            {"targetId": "TARGET-1", "type": "page", "url": "https://example.com/"},
+        ]
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        session_calls.append((target_id, calls))
+        return [{}] * len(calls)
+
+    monkeypatch.setattr(Daemon, "extension_request", extension_request)
+    monkeypatch.setattr(CdpBrowser, "targets", targets)
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "browser-solve-captcha",
+                    "payload": {"profile": "default", "action": "click_checkbox"},
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data["clicked"] is True
+    assert (
+        result.data["reason"]
+        == "clicked via CDP-level coordinate dispatch (cross-origin iframe checkbox)"
+    )
+    assert result.data["click"]["x"] == 40.0
+    assert result.data["click"]["y"] == 59.0
+    assert len(session_calls) == 1
+    target_id, calls = session_calls[0]
+    assert target_id == "TARGET-1"
+    assert [call[0] for call in calls] == [
+        "Input.dispatchMouseEvent",
+        "Input.dispatchMouseEvent",
+        "Input.dispatchMouseEvent",
+    ]
+
+
+def test_browser_solve_captcha_detect_never_attempts_a_cdp_click(monkeypatch, tmp_path) -> None:
+    """``detect`` never escalates to CDP, even if a rect happened to be present."""
+
+    async def extension_request(
+        self: Daemon, kind: str, payload: dict[str, Any], profile: str
+    ) -> dict[str, Any]:
+        return {"detected": True, "clicked": False}
+
+    async def targets(self: CdpBrowser) -> list[dict[str, Any]]:
+        raise AssertionError("targets() must never be called for a plain detect")
+
+    monkeypatch.setattr(Daemon, "extension_request", extension_request)
+    monkeypatch.setattr(CdpBrowser, "targets", targets)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "browser-solve-captcha",
+                    "payload": {"profile": "default", "action": "detect"},
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data == {"detected": True, "clicked": False, "profile": "default"}
+
+
+def test_browser_solve_captcha_click_checkbox_without_a_matching_target_returns_the_raw_reply(
+    monkeypatch, tmp_path
+) -> None:
+    """If no live CDP target matches the reported url (tab closed mid-flight, e.g.), the raw
+    extension reply is returned unchanged rather than raising."""
+
+    async def extension_request(
+        self: Daemon, kind: str, payload: dict[str, Any], profile: str
+    ) -> dict[str, Any]:
+        return {
+            "detected": True,
+            "clicked": False,
+            "reason": "reported iframe rect for CDP-level coordinate click",
+            "rect": {"left": 0.0, "top": 0.0, "width": 304.0, "height": 78.0},
+            "url": "https://example.com/",
+        }
+
+    async def targets(self: CdpBrowser) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(Daemon, "extension_request", extension_request)
+    monkeypatch.setattr(CdpBrowser, "targets", targets)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+
+    result = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "browser-solve-captcha",
+                    "payload": {"profile": "default", "action": "click_checkbox"},
+                },
+            )
+        )
+    )
+
+    assert result.meta.status == "ok"
+    assert result.data["clicked"] is False
 
 
 def _window_save_fixture(monkeypatch, tmp_path) -> Daemon:
@@ -1396,3 +1905,54 @@ def test_window_save_restore_saved_actions_are_not_approval_gated() -> None:
     admin-tier, same as `profile-remove` — never touches the live browser at all)."""
     for name in ("window-save", "window-restore", "window-saved-list", "window-saved-remove"):
         assert REGISTRY[name].policy.approval is False, name
+
+
+def test_page_screenshot_result_field_is_path_not_output(monkeypatch, tmp_path) -> None:
+    """Regression guard for the documented drift (KπX, fixed): `page-screenshot` with an
+    `output` PAYLOAD field writes decoded bytes and returns the RESULT field `path` — never a
+    result field named `output` (which connoted the payload name). When `output` is omitted,
+    the result carries base64 `data` instead."""
+    import base64 as _b64
+
+    async def page_session(
+        self: CdpBrowser, target_id: str, session_calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        del self, target_id
+        return [{"data": _b64.b64encode(b"PNGDATA").decode()} for _ in session_calls]
+
+    monkeypatch.setattr(CdpBrowser, "page_session", page_session)
+    daemon = _daemon_with_profile(tmp_path, monkeypatch)
+    dest = tmp_path / "shot.png"
+
+    saved = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="1",
+                method="do",
+                params={
+                    "action": "page-screenshot",
+                    "payload": {"profile": "default", "target_id": "t1", "output": str(dest)},
+                },
+            )
+        )
+    )
+    assert saved.meta.status == "ok"
+    assert "path" in saved.data and saved.data["path"] == str(dest)
+    assert "output" not in saved.data
+    assert dest.read_bytes() == b"PNGDATA"
+
+    raw = asyncio.run(
+        daemon.dispatch(
+            RpcRequest(
+                id="2",
+                method="do",
+                params={
+                    "action": "page-screenshot",
+                    "payload": {"profile": "default", "target_id": "t1"},
+                },
+            )
+        )
+    )
+    assert raw.meta.status == "ok"
+    assert raw.data["data"] == _b64.b64encode(b"PNGDATA").decode()
+    assert "path" not in raw.data

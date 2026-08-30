@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import math
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from browser_proxy.cdp import CdpBrowser, CdpParams
+from browser_proxy.cdp import CdpBrowser, CdpParams, ConsoleCapture
 from browser_proxy.doc import attach_public_docstrings
 from browser_proxy.paths import (
     edge_cdp_port,
@@ -102,6 +103,24 @@ class DaemonContext(Protocol):
             >>> DaemonContext.extension_request.__name__
             'extension_request'
             >>> asyncio.iscoroutinefunction(DaemonContext.extension_request)
+            True
+        """
+        ...
+
+    async def console_capture(self, profile: str, target_id: str) -> "ConsoleCapture":
+        """Purpose: fetch or create the persistent per-target console capture for one profile.
+
+        Args:
+            profile (str): Managed Edge profile name.
+            target_id (str): CDP page target ID whose console output to capture.
+
+        Returns:
+            ConsoleCapture: Started persistent capture with a session that survives reloads.
+
+        Examples:
+            >>> DaemonContext.console_capture.__name__
+            'console_capture'
+            >>> asyncio.iscoroutinefunction(DaemonContext.console_capture)
             True
         """
         ...
@@ -2077,6 +2096,95 @@ async def _page_click(payload: dict[str, Any], context: DaemonContext) -> dict[s
     }
 
 
+async def _page_click_coordinates(
+    payload: dict[str, Any], context: DaemonContext
+) -> dict[str, Any]:
+    """Purpose: click an Edge page at explicit viewport coordinates via page-scoped CDP.
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``target_id``, numeric ``x``/``y``, and
+            optional ``button``/``click_count``.
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: Profile, target ID, clicked coordinates, button, click count, and flag.
+
+    Notes:
+        Unlike ``page-click`` (which resolves a CSS selector to its element box via the DOM
+        domain), this action dispatches the ``Input.dispatchMouseEvent`` sequence directly at
+        caller-provided viewport coordinates — the same page-scoped CDP events ``page-click``
+        issues, at a location no selector can address (e.g. a cross-origin iframe such as a
+        reCAPTCHA widget, whose inner document is intentionally unreachable from the parent
+        page's DOM). ``x`` and ``y`` are viewport-relative CSS pixels, as returned by
+        ``getBoundingClientRect()`` from the parent page perspective. ``button`` (one of
+        ``left``/``middle``/``right``/``back``/``forward``) and ``click_count`` (1 for a plain
+        click, 2+ for double/triple clicks) mirror the CDP ``Input.dispatchMouseEvent`` fields —
+        a double-click is emitted as pressed/released pairs whose ``clickCount`` escalates 1, 2,
+        … exactly as a real mouse would. Like its selector-based twin, the click is directly
+        observable on an always-visible managed window and is therefore deliberately NOT
+        approval-gated.
+
+    Examples:
+        >>> _page_click_coordinates.__name__
+        '_page_click_coordinates'
+        >>> callable(_page_click_coordinates)
+        True
+    """
+    name, browser = _profile(payload, context)
+    target_id = str(payload.get("target_id", ""))
+    raw_x = payload.get("x")
+    raw_y = payload.get("y")
+    if raw_x is None or raw_y is None:
+        raise ValueError("x and y must be numbers")
+    try:
+        x = float(raw_x)
+        y = float(raw_y)
+    except (TypeError, ValueError) as error:
+        raise ValueError("x and y must be numbers") from error
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError("x and y must be finite numbers")
+    if not target_id:
+        raise ValueError("target_id is required")
+    button = str(payload.get("button", "left"))
+    if button not in ("left", "middle", "right", "back", "forward"):
+        raise ValueError("button must be one of left, middle, right, back, forward")
+    raw_count = payload.get("click_count", 1)
+    try:
+        click_count = int(raw_count)
+    except (TypeError, ValueError) as error:
+        raise ValueError("click_count must be a positive integer") from error
+    if isinstance(raw_count, float) and not raw_count.is_integer():
+        raise ValueError("click_count must be a positive integer")
+    if click_count < 1:
+        raise ValueError("click_count must be a positive integer")
+    calls: list[tuple[str, CdpParams]] = [
+        ("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    ]
+    for count in range(1, click_count + 1):
+        calls.append(
+            (
+                "Input.dispatchMouseEvent",
+                {"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": count},
+            )
+        )
+        calls.append(
+            (
+                "Input.dispatchMouseEvent",
+                {"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": count},
+            )
+        )
+    await browser.page_session(target_id, calls)
+    return {
+        "profile": name,
+        "target_id": target_id,
+        "x": x,
+        "y": y,
+        "button": button,
+        "click_count": click_count,
+        "clicked": True,
+    }
+
+
 async def _page_hover(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: move the pointer over an Edge page element resolved by CSS selector.
 
@@ -2284,7 +2392,11 @@ async def _page_evaluate(payload: dict[str, Any], context: DaemonContext) -> dic
     Returns:
         dict[str, Any]: Profile, target ID, and the evaluated JSON-safe result value. Same trust
         model as the existing ``raw`` action's already-whitelisted ``Runtime.evaluate``: arbitrary
-        JS runs with full page privileges.
+        JS runs with full page privileges. An expression evaluating to a value CDP cannot
+        JSON-serialize (e.g. ``window.open(...)`` returns a ``Window`` object with circular
+        references — live-verified: always fails with ``CDP_ERROR: Object reference chain is too
+        long`` under ``returnByValue: true``) is retried once without ``returnByValue``, returning
+        a safe textual ``description``/``type`` instead of crashing the whole call (KπX, GRAVÉ).
 
     Examples:
         >>> _page_evaluate.__name__
@@ -2298,15 +2410,33 @@ async def _page_evaluate(payload: dict[str, Any], context: DaemonContext) -> dic
     if not target_id or not expression:
         raise ValueError("target_id and expression are required")
     await_promise = bool(payload.get("await_promise", False))
-    result = await browser.page_session(
-        target_id,
-        [
-            (
-                "Runtime.evaluate",
-                {"expression": expression, "returnByValue": True, "awaitPromise": await_promise},
-            )
-        ],
-    )
+    try:
+        result = await browser.page_session(
+            target_id,
+            [
+                (
+                    "Runtime.evaluate",
+                    {
+                        "expression": expression,
+                        "returnByValue": True,
+                        "awaitPromise": await_promise,
+                    },
+                )
+            ],
+        )
+    except RuntimeError as error:
+        if "Object reference chain is too long" not in str(error):
+            raise
+        result = await browser.page_session(
+            target_id,
+            [("Runtime.evaluate", {"expression": expression, "awaitPromise": await_promise})],
+        )
+        remote = result[0].get("result", {})
+        return {
+            "profile": name,
+            "target_id": target_id,
+            "result": remote.get("description") or remote.get("type"),
+        }
     if exception := result[0].get("exceptionDetails"):
         raise RuntimeError(f"CDP_ERROR: {exception.get('text', 'evaluation failed')}")
     return {
@@ -2454,16 +2584,27 @@ def _index_dom_tree(node: dict[str, Any], by_node_id: dict[int, dict[str, Any]])
 
 
 async def _page_console_list(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: read (and optionally clear) console messages captured since hook install.
+    """Purpose: read (and optionally clear) console messages captured for an Edge page — now via
+    a PERSISTENT boot-time hook, so logs are captured from the page's OWN loading sequence, not
+    only after this action first runs (KπX, GRAVÉ: "comment avoir les logs meme quand deja
+    charge ?" — the old per-call `Runtime.evaluate` override died with its detached session;
+    a `Page.addScriptToEvaluateOnNewDocument` injection survives reloads only while its session
+    stays attached, which the daemon's `console_capture()` registry now guarantees).
 
     Args:
-        payload (dict[str, Any]): Profile, required ``target_id``, and optional ``clear``. Only
-            messages emitted after this action first installs its console hook on that page are
-            captured (best-effort, no native CDP event listening in this architecture).
-        context (DaemonContext): Daemon state used to resolve the Edge profile.
+        payload (dict[str, Any]): Profile, required ``target_id``, and optional ``clear``.
+        context (DaemonContext): Daemon state used to resolve the profile and hold the persistent
+            capture.
 
     Returns:
-        dict[str, Any]: Profile, target ID, and captured console message records.
+        dict[str, Any]: Profile, target ID, and captured console message records
+        (``[{level, args, ts}, ...]``, bounded at 2000, real console methods kept in passthrough —
+        the page keeps working normally).
+
+    Notes:
+        Practically: the FIRST call installs the persistent hook (and captures any live messages
+        from that moment in the current document); a subsequent ``page-reload`` then produces the
+        FULL boot log sequence on the next read — no more permanently-empty first reads.
 
     Examples:
         >>> _page_console_list.__name__
@@ -2471,29 +2612,13 @@ async def _page_console_list(payload: dict[str, Any], context: DaemonContext) ->
         >>> callable(_page_console_list)
         True
     """
-    name, browser = _profile(payload, context)
+    name, _browser = _profile(payload, context)
     target_id = str(payload.get("target_id", ""))
     if not target_id:
         raise ValueError("target_id is required")
     clear = bool(payload.get("clear", False))
-    expression = (
-        "(() => { "
-        "if (!window.__browserProxyConsole) { "
-        "window.__browserProxyConsole = []; "
-        "for (const level of ['log', 'warn', 'error', 'info']) { "
-        "const original = console[level].bind(console); "
-        "console[level] = (...args) => { "
-        "window.__browserProxyConsole.push("
-        "{level, args: args.map(String), ts: Date.now()}); "
-        "original(...args); }; } } "
-        "const messages = window.__browserProxyConsole.slice(); "
-        f"if ({json.dumps(clear)}) {{ window.__browserProxyConsole.length = 0; }} "
-        "return messages; })()"
-    )
-    result = await browser.page_session(
-        target_id, [("Runtime.evaluate", {"expression": expression, "returnByValue": True})]
-    )
-    messages = result[0].get("result", {}).get("value", [])
+    capture = await context.console_capture(name, target_id)
+    messages = await capture.entries(clear=clear)
     return {"profile": name, "target_id": target_id, "messages": messages}
 
 
@@ -2537,8 +2662,10 @@ async def _page_dialog_policy(payload: dict[str, Any], context: DaemonContext) -
 
     Args:
         payload (dict[str, Any]): Profile, ``target_id``, ``action`` (accept/dismiss), opt.
-            ``prompt_text``. Does not survive a future full navigation on this architecture since
-            ``Page.addScriptToEvaluateOnNewDocument`` with a persistent session is not used.
+            ``prompt_text``. **Correct sequence (KπX, GRAVÉ):** navigate/reload to target page
+            FIRST, then install policy, then trigger alert. Installing before reload loses the
+            override because ``Runtime.evaluate`` does not survive a page load (no persistent
+            ``Page.addScriptToEvaluateOnNewDocument`` session).
         context (DaemonContext): Daemon state used to resolve the Edge profile.
 
     Returns:
@@ -2583,18 +2710,24 @@ async def _cookie_list(payload: dict[str, Any], context: DaemonContext) -> dict[
         True
     """
     name, browser = _profile(payload, context)
-    result = await browser.call("Network.getCookies", {})
+    result = await browser.call("Storage.getCookies", {})
     return {"profile": name, "cookies": result.get("cookies", [])}
 
 
 @require_approval
 @require_verification("name")
 async def _cookie_set(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: set one browser-level cookie for a started Edge profile.
+    """Purpose: set one browser-level cookie for a started Edge profile — profile-wide, not
+    page-scoped (KπX, GRAVÉ: live-verified the old `Network.setCookie` backend always failed with
+    `CDP_ERROR: 'Network.setCookie' wasn't found` because `Network.*` requires a per-page session;
+    the correct browser-level backend is `Storage.setCookies`, whose plural method accepts a list
+    and REQUIRES the cookie's `url` for categorization — the singular `Storage.setCookie` does not
+    exist at the browser level, probed live method by method).
 
     Args:
         payload (dict[str, Any]): Profile, ``name``, ``value``, ``domain``, optional ``path``,
-            ``secure``, ``http_only``.
+            ``secure``, ``http_only``. The scheme for the required CDP ``url`` is derived: an
+            ``secure`` cookie implies `https://`, otherwise `http://`.
         context (DaemonContext): Daemon state used to resolve the Edge profile.
 
     Returns:
@@ -2611,15 +2744,22 @@ async def _cookie_set(payload: dict[str, Any], context: DaemonContext) -> dict[s
     domain = str(payload.get("domain", ""))
     if not cookie_name or not domain:
         raise ValueError("name and domain are required")
+    secure = bool(payload.get("secure", True))
+    cookie_url = f"https://{domain}/" if secure else f"http://{domain}/"
     await browser.call(
-        "Network.setCookie",
+        "Storage.setCookies",
         {
-            "name": cookie_name,
-            "value": str(payload.get("value", "")),
-            "domain": domain,
-            "path": str(payload.get("path", "/")),
-            "secure": bool(payload.get("secure", True)),
-            "httpOnly": bool(payload.get("http_only", False)),
+            "cookies": [
+                {
+                    "name": cookie_name,
+                    "value": str(payload.get("value", "")),
+                    "domain": domain,
+                    "path": str(payload.get("path", "/")),
+                    "secure": secure,
+                    "httpOnly": bool(payload.get("http_only", False)),
+                    "url": cookie_url,
+                }
+            ]
         },
     )
     return {"profile": name, "name": cookie_name, "domain": domain, "set": True}
@@ -2628,7 +2768,11 @@ async def _cookie_set(payload: dict[str, Any], context: DaemonContext) -> dict[s
 @require_approval
 @require_preflight("name", "domain")
 async def _cookie_remove(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: remove one browser-level cookie by name and domain.
+    """Purpose: remove one browser-level cookie by name and domain. `Network.deleteCookies` needs a
+    per-page session (the browser level exposes neither `Network.*` nor `Storage.deleteCookies`,
+    probed live), so one real page target receives the call — the default profile's first live
+    page target. Cookies are profile-shared, so deleting through any of the profile's pages removes
+    the cookie for the whole profile.
 
     Args:
         payload (dict[str, Any]): Profile, required ``name``, and required ``domain``.
@@ -2648,7 +2792,19 @@ async def _cookie_remove(payload: dict[str, Any], context: DaemonContext) -> dic
     domain = str(payload.get("domain", ""))
     if not cookie_name or not domain:
         raise ValueError("name and domain are required")
-    await browser.call("Network.deleteCookies", {"name": cookie_name, "domain": domain})
+    page_targets = [t for t in await browser.targets() if t.get("type") == "page"]
+    if not page_targets:
+        raise RuntimeError("CDP_ERROR: no live page target available for cookie deletion")
+    # KπX, GRAVÉ: found live while wiring browser-solve-captcha's own target lookup — raw
+    # `Target.getTargets` entries key the CDP target id as `targetId`, never `id` (confirmed live
+    # via `do raw` earlier this session); the previous `["id"]` here always raised `KeyError` on
+    # real CDP data and was masked because its own unit test mocked `{"id": ...}` (matching the bug,
+    # not real CDP shape) and the one live attempt failed earlier at the extension-approval step,
+    # never reaching this line.
+    target_id = str(page_targets[0]["targetId"])
+    await browser.page_session(
+        target_id, [("Network.deleteCookies", {"name": cookie_name, "domain": domain})]
+    )
     return {"profile": name, "name": cookie_name, "domain": domain, "removed": True}
 
 
@@ -2715,6 +2871,69 @@ async def _storage_local_set(payload: dict[str, Any], context: DaemonContext) ->
     expression = f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)})"
     await browser.page_session(target_id, [("Runtime.evaluate", {"expression": expression})])
     return {"profile": name, "target_id": target_id, "key": key, "set": True}
+
+
+@require_approval
+@require_preflight("keys")
+async def _storage_local_remove(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: remove one or MORE Edge page ``localStorage`` entries by key, batch, in ONE call —
+    completes the symmetric storage/cookie action pair (KπX: live-verified `localStorage.getItem`/
+    `setItem` had no `removeItem`/`clear` counterpart; probed live via `page-evaluate` before
+    building this dedicated action).
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``target_id``, and ``keys`` — a non-empty list
+            of localStorage keys to remove in ONE call, never one call per key.
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: Profile, target ID, the removed keys, and a confirmed removed flag.
+
+    Examples:
+        >>> _storage_local_remove.__name__
+        '_storage_local_remove'
+        >>> callable(_storage_local_remove)
+        True
+    """
+    name, browser = _profile(payload, context)
+    target_id = str(payload.get("target_id", ""))
+    keys = payload.get("keys")
+    if not target_id or not isinstance(keys, list) or not keys:
+        raise ValueError("target_id is required and keys must be a non-empty list")
+    key_list = [str(key) for key in keys]
+    expression = "; ".join(f"localStorage.removeItem({json.dumps(key)})" for key in key_list)
+    await browser.page_session(target_id, [("Runtime.evaluate", {"expression": expression})])
+    return {"profile": name, "target_id": target_id, "keys": key_list, "removed": True}
+
+
+@require_approval
+async def _storage_local_clear(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: wipe EVERY Edge page ``localStorage`` entry for one page's origin in ONE call —
+    completes the symmetric storage/cookie action pair, same rationale as `_storage_local_remove`.
+
+    Args:
+        payload (dict[str, Any]): Profile and required ``target_id``. No identity field to
+            preflight beyond the always-validated `target_id` — same shape as other whole-origin
+            wipes in this registry.
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: Profile, target ID, and a confirmed cleared flag.
+
+    Examples:
+        >>> _storage_local_clear.__name__
+        '_storage_local_clear'
+        >>> callable(_storage_local_clear)
+        True
+    """
+    name, browser = _profile(payload, context)
+    target_id = str(payload.get("target_id", ""))
+    if not target_id:
+        raise ValueError("target_id is required")
+    await browser.page_session(
+        target_id, [("Runtime.evaluate", {"expression": "localStorage.clear()"})]
+    )
+    return {"profile": name, "target_id": target_id, "cleared": True}
 
 
 @require_approval
@@ -2874,15 +3093,29 @@ async def _browser_dismiss_overlays(
 
 
 async def _browser_solve_captcha(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: detect or drive a CAPTCHA challenge through the paired extension.
+    """Purpose: detect or drive a CAPTCHA challenge, escalating ``click_checkbox`` to a REAL
+    compositor-level CDP click when the extension reports a detected iframe (KπX, GRAVÉ —
+    live-verified against the official Google reCAPTCHA demo: a content-script click on a
+    genuinely cross-origin iframe — `www.google.com`, confirmed live via the iframe's own `src`,
+    which is how EVERY real deployment serves it — never reaches the checkbox rendered inside it).
+    The extension reports the iframe's own bounding rect + the tab's `url` (never attempts the
+    ineffective same-origin click itself any more); this daemon correlates that `url` against
+    `browser.targets()` to resolve the CDP `target_id` (the two id systems have no first-class
+    mapping — same correlation need as `_correlate_cdp_targets()`, here by exact URL match since a
+    single active-tab lookup is unambiguous), computes the checkbox's stable click point (its icon
+    sits a fixed ~30px from the anchor iframe's left edge, vertically centered, regardless of
+    overall widget width/theme — live-verified), and dispatches the exact same
+    ``Input.dispatchMouseEvent`` sequence ``page-click-coordinates`` uses for a location no CSS
+    selector can address.
 
     Args:
         payload (dict[str, Any]): Profile, ``action`` (detect/click_checkbox/click_grid), opt.
             ``cells``.
-        context (DaemonContext): Daemon state exposing the paired extension.
+        context (DaemonContext): Daemon state exposing the paired extension and CDP browser.
 
     Returns:
-        dict[str, Any]: Extension-confirmed CAPTCHA interaction information.
+        dict[str, Any]: Extension-confirmed CAPTCHA interaction information; for a successfully
+        escalated ``click_checkbox``, also the real coordinates clicked (nested ``click`` key).
 
     Examples:
         >>> _browser_solve_captcha.__name__
@@ -2890,7 +3123,38 @@ async def _browser_solve_captcha(payload: dict[str, Any], context: DaemonContext
         >>> callable(_browser_solve_captcha)
         True
     """
-    return await _extension(payload, context, "captcha.solve")
+    reply = await _extension(payload, context, "captcha.solve")
+    action = str(payload.get("action", ""))
+    rect = reply.get("rect")
+    tab_url = reply.get("url")
+    if action != "click_checkbox" or not isinstance(rect, dict) or not tab_url:
+        return reply
+    _, browser = _profile(payload, context)
+    matches = [
+        target
+        for target in await browser.targets()
+        if target.get("type") == "page" and target.get("url") == tab_url
+    ]
+    if not matches:
+        return reply
+    target_id = str(matches[0]["targetId"])
+    click_x = float(rect["left"]) + 30.0
+    click_y = float(rect["top"]) + float(rect["height"]) / 2.0
+    click_result = await _page_click_coordinates(
+        {
+            "profile": payload.get("profile", "default"),
+            "target_id": target_id,
+            "x": click_x,
+            "y": click_y,
+        },
+        context,
+    )
+    return {
+        **reply,
+        "clicked": True,
+        "reason": "clicked via CDP-level coordinate dispatch (cross-origin iframe checkbox)",
+        "click": click_result,
+    }
 
 
 async def _browser_set_date(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
@@ -2972,14 +3236,31 @@ async def _browser_get_new_tab(payload: dict[str, Any], context: DaemonContext) 
 
 
 async def _raw(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: execute one browser-level CDP method after daemon policy enforcement.
+    """Purpose: execute ONE operation across any of the three protocol families — absolute
+    flexibility, never freezing the protocol (KπX, GRAVÉ: "il devrait permettre de faire tout ce
+    que les autres do permettent et en plus d'autres choses... sans figer le protocole").
 
     Args:
-        payload (dict[str, Any]): Profile, CDP ``method``, and object-valued ``params``.
+        payload (dict[str, Any]): Profile, ``method``, optional ``params``, optional
+            ``protocol`` (``"cdp-browser"`` default | ``"cdp-page"`` | ``"ext"``), and, for
+            ``cdp-page``, required ``target_id`` plus optional ``calls`` (an ORDERED list of
+            ``[method, params]`` pairs executed sequentially within ONE attached page session —
+            later calls may reference earlier results via callables, same ``CdpParams`` mechanism
+            every ``page-*`` action uses). For ``ext``, ``params`` may be an object (single
+            argument) OR a list (positional arguments), e.g.
+            ``{"protocol":"ext","method":"storage.local.get","params":[null]}``.
         context (DaemonContext): Daemon state used to resolve the profile.
 
     Returns:
-        dict[str, Any]: Profile, CDP method, and its CDP result object.
+        dict[str, Any]: ``{profile, protocol, method, result}`` — ``result`` is the raw backend
+        response, never re-wrapped: CDP browser-level result object, CDP page-level result list
+        (one entry per ``calls`` entry, or a single result for a bare ``method``), or the chrome
+        API result for ``ext``. Any JSON value is returned faithfully (dict/list/str/bool), never
+        coerced.
+
+    Notes:
+        The dynamic read-only allowlist (``daemon.dispatch``) applies; every other method is
+        fail-closed approval-gated, identically across all three families.
 
     Examples:
         >>> _raw.__name__
@@ -2987,12 +3268,94 @@ async def _raw(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any
         >>> callable(_raw)
         True
     """
+    protocol = str(payload.get("protocol", "cdp-browser")).strip().lower()
+    if protocol == "cdp-page" and payload.get("calls") is not None:
+        # A `calls` bundle carries its own per-call methods — no top-level `method` needed.
+        return await _raw_page_bundle(payload, context)
     method = str(payload.get("method", ""))
+    if not method:
+        raise ValueError("method is required")
     params = payload.get("params", {})
-    if not isinstance(params, dict):
-        raise ValueError("params must be a JSON object")
     name, browser = _profile(payload, context)
-    return {"profile": name, "method": method, "result": await browser.call(method, params)}
+    if protocol == "cdp-browser":
+        if not isinstance(params, dict):
+            raise ValueError("params must be a JSON object for cdp-browser")
+        return {
+            "profile": name,
+            "protocol": protocol,
+            "method": method,
+            "result": await browser.call(method, params),
+        }
+    if protocol == "cdp-page":
+        target_id = str(payload.get("target_id", ""))
+        if not target_id:
+            raise ValueError("target_id is required for cdp-page")
+        if not isinstance(params, dict):
+            raise ValueError("params must be a JSON object for a single cdp-page method")
+        return {
+            "profile": name,
+            "protocol": protocol,
+            "target_id": target_id,
+            "method": method,
+            "result": (await browser.page_session(target_id, [(method, params)]))[0],
+        }
+    if protocol == "ext":
+        return {
+            "profile": name,
+            "protocol": protocol,
+            "method": method,
+            "result": await _extension(payload, context, "chrome.call"),
+        }
+    raise ValueError(f"unknown protocol: {protocol}")
+
+
+async def _raw_page_bundle(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: run an ordered `calls` bundle within ONE attached CDP page session (`cdp-page` raw).
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``target_id``, and required non-empty
+            ``calls`` — an ordered list of ``[method, params]`` pairs.
+        context (DaemonContext): Daemon state used to resolve the profile.
+
+    Returns:
+        dict[str, Any]: ``{profile, protocol, target_id, calls: [methods...], result: [...]}`` —
+        one result entry per call, same order, from a single attach/detach (node ids from earlier
+        calls stay valid for later ones within the same session).
+
+    Notes:
+        This is the only raw form that does NOT require a top-level ``method`` — each ``calls``
+        entry carries its own.
+
+    Examples:
+        >>> asyncio.iscoroutinefunction(_raw_page_bundle)
+        True
+        >>> callable(_raw_page_bundle)
+        True
+    """
+    name, browser = _profile(payload, context)
+    target_id = str(payload.get("target_id", ""))
+    if not target_id:
+        raise ValueError("target_id is required for cdp-page")
+    raw_calls = payload.get("calls")
+    if not isinstance(raw_calls, list) or not raw_calls:
+        raise ValueError("calls must be a non-empty ordered list of [method, params] pairs")
+    calls: list[tuple[str, CdpParams]] = []
+    for pair in raw_calls:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not isinstance(pair[0], str)
+            or not isinstance(pair[1], dict)
+        ):
+            raise ValueError("each call must be [method, params] with object params")
+        calls.append((pair[0], pair[1]))
+    return {
+        "profile": name,
+        "protocol": "cdp-page",
+        "target_id": target_id,
+        "calls": [call[0] for call in calls],
+        "result": await browser.page_session(target_id, calls),
+    }
 
 
 def _action(name: str, group: str, handler: Handler) -> ActionDef:
@@ -3051,6 +3414,7 @@ REGISTRY = {
         _action("page-back", "Navigation", _page_back),
         _action("page-forward", "Navigation", _page_forward),
         _action("page-click", "Interaction", _page_click),
+        _action("page-click-coordinates", "Interaction", _page_click_coordinates),
         _action("page-hover", "Interaction", _page_hover),
         _action("page-type", "Interaction", _page_type),
         _action("page-fill-form", "Interaction", _page_fill_form),
@@ -3068,6 +3432,8 @@ REGISTRY = {
         _action("cookie-remove", "Cookies", _cookie_remove),
         _action("storage-local-get", "Storage", _storage_local_get),
         _action("storage-local-set", "Storage", _storage_local_set),
+        _action("storage-local-remove", "Storage", _storage_local_remove),
+        _action("storage-local-clear", "Storage", _storage_local_clear),
         _action("group-create", "Groups", _group_create),
         _action("group-update", "Groups", _group_update),
         _action("group-move", "Groups", _group_move),

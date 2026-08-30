@@ -26,6 +26,7 @@ ENV_AUTOSAVE_DIR = "BROWSER_PROXY_AUTOSAVE_DIR"
 ENV_PREVIEW_LINES = "BROWSER_PROXY_PREVIEW_LINES"
 ENV_HITL_TIMEOUT_SECONDS = "BROWSER_PROXY_HITL_TIMEOUT_SECONDS"
 ENV_IPC_MAX_MESSAGE_BYTES = "BROWSER_PROXY_IPC_MAX_MESSAGE_BYTES"
+ENV_CDP_MAX_FRAME_BYTES = "BROWSER_PROXY_CDP_MAX_FRAME_BYTES"
 
 # --- Default values ---
 EXTENSION_PORT_DEFAULT = 37291
@@ -77,3 +78,16 @@ the CLI's own preview/autosave truncation ever got a chance to run. 64 MiB is ge
 for any legitimate single-page CDP result while still bounding memory against a malformed or
 hostile length prefix — this daemon is reachable only via a same-user Unix socket, never a network
 listener, so the bound exists for correctness/memory-safety, not as a network hardening control."""
+
+CDP_MAX_FRAME_BYTES_DEFAULT = 64 * 1024 * 1024
+"""Ceiling for ONE WebSocket frame on the direct CDP connection (``CdpBrowser``), passed as
+``max_size`` to every ``websockets.connect()``. Root-caused live (KπX, GRAVÉ — surfaced while
+reading a large Zimbra inbox via ``page-click``): the `websockets` library default is 1 MiB
+(``2**20``), and a heavy single CDP response on a complex page — e.g. ``DOM.getDocument(depth:-1)``
+serializing a whole huge DOM tree — exceeds that limit, so the library raises
+``websockets.exceptions.ConnectionClosedError: sent 1009 (message too big) frame exceeds limit of
+1048576 bytes`` and kills the connection mid-request, surfacing to the CLI as a misleading
+``IPC_ERROR: connection closed before a length prefix arrived`` (the client saw the daemon's
+socket die, not the real frame-limit cause). Mirroring the IPC ceiling at 64 MiB removes the whole
+class; the connection is loopback-only, so the bound exists for memory-safety, never as a network
+hardening control."""

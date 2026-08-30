@@ -9,12 +9,36 @@ Examples:
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 from urllib.request import urlopen
 
 from websockets.asyncio.client import connect
+
+from browser_proxy import config
+
+
+def _cdp_max_frame_bytes() -> int:
+    """Purpose: resolve the configured per-frame CDP WebSocket ceiling at call time.
+
+    Args:
+        None: Reads the optional ``BROWSER_PROXY_CDP_MAX_FRAME_BYTES`` environment value.
+
+    Returns:
+        int: The maximum allowed single WebSocket frame in bytes, always at least 1 so a
+        misconfigured override can never silently disable the bound entirely.
+
+    Examples:
+        >>> _cdp_max_frame_bytes() > 0
+        True
+        >>> isinstance(_cdp_max_frame_bytes(), int)
+        True
+    """
+    raw = os.environ.get(config.ENV_CDP_MAX_FRAME_BYTES, str(config.CDP_MAX_FRAME_BYTES_DEFAULT))
+    return max(1, int(raw))
+
 
 CdpParams = dict[str, Any] | Callable[[list[dict[str, Any]]], dict[str, Any]]
 """One call's CDP params in a `page_session()` chain — either a plain, precomputed dict, or a
@@ -136,7 +160,9 @@ class CdpBrowser:
 
         self._next_id += 1
         request_id = self._next_id
-        async with connect(await self._browser_ws_url()) as websocket:
+        async with connect(
+            await self._browser_ws_url(), max_size=_cdp_max_frame_bytes()
+        ) as websocket:
             await websocket.send(json.dumps({"id": request_id, "method": method, "params": params}))
             async for raw in _messages(websocket):
                 response = json.loads(raw)
@@ -236,7 +262,9 @@ class CdpBrowser:
             >>> CdpBrowser(9222)._next_id
             0
         """
-        async with connect(await self._browser_ws_url()) as websocket:
+        async with connect(
+            await self._browser_ws_url(), max_size=_cdp_max_frame_bytes()
+        ) as websocket:
             self._next_id += 1
             attach_id = self._next_id
             await websocket.send(
@@ -318,3 +346,278 @@ async def _messages(websocket: Any) -> AsyncIterator[str]:
     async for message in websocket:
         if isinstance(message, str):
             yield message
+
+
+class ConsoleCapture:
+    """Persistent per-target console capture via a long-lived attached CDP session.
+
+    The pre-existing `page-console-list` used a per-call detached `Runtime.evaluate` override,
+    which died with its session — messages emitted by an already-loaded page before the first
+    read stayed permanently invisible. A script injected through
+    ``Page.addScriptToEvaluateOnNewDocument`` survives page reloads ONLY while its session stays
+    attached, so this class holds ONE attached flattened session open (a pump task keeps the
+    websocket alive), re-installing the override before every document's own scripts run. Root
+    cause of the limitation (KπX, GRAVÉ: "comment avoir les logs meme quand deja charge ?"):
+    transient sessions could never install a persistent hook.
+    """
+
+    def __init__(self, port: int, target_id: str) -> None:
+        """Purpose: prepare an unstarted persistent console capture for one CDP page target.
+
+        Args:
+            port (int): Loopback CDP browser port (``edge_cdp_port(profile)``).
+            target_id (str): CDP page target ID whose console output this capture observes.
+
+        Returns:
+            None: The capture only connects once ``start()`` is awaited.
+
+        Examples:
+            >>> ConsoleCapture(9222, "t").target_id
+            't'
+            >>> ConsoleCapture(9222, "t")._port
+            9222
+        """
+        self._port = port
+        self.target_id = target_id
+        self._session_id: str | None = None
+        self._pump_task: asyncio.Task[None] | None = None
+        self._websocket: Any = None
+        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._next_id = 0
+
+    async def start(self) -> None:
+        """Purpose: connect, attach one flattened session, and install the boot override.
+
+        Args:
+            self (ConsoleCapture): Capture instance (unstarted).
+
+        Returns:
+            None: The session stays attached and the pump task keeps the websocket open until
+            ``stop()`` — the injected script therefore survives reloads.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ConsoleCapture.start)
+            True
+            >>> ConsoleCapture(9222, "t").target_id
+            't'
+        """
+        self._websocket = await connect(
+            await self._ws_url(), max_size=_cdp_max_frame_bytes()
+        ).__aenter__()
+        self._next_id += 1
+        attach_id = self._next_id
+        await self._websocket.send(
+            json.dumps(
+                {
+                    "id": attach_id,
+                    "method": "Target.attachToTarget",
+                    "params": {"targetId": self.target_id, "flatten": True},
+                }
+            )
+        )
+        async for raw in _messages(self._websocket):
+            response = json.loads(raw)
+            if response.get("id") == attach_id:
+                result = response.get("result", {})
+                if isinstance(result, dict) and result.get("sessionId"):
+                    self._session_id = str(result["sessionId"])
+                break
+        if not self._session_id:
+            await self._websocket.__aexit__(None, None, None)
+            self._websocket = None
+            raise RuntimeError("CDP_ERROR: attach did not return sessionId")
+        self._pump_task = asyncio.create_task(self._pump())
+        # ⚠️ Edge REQUIRES Page.enable on the session BEFORE addScriptToEvaluateOnNewDocument —
+        # without it the script registers (returns an identifier) but is SILENTLY dropped on the
+        # next navigation: verified live with a minimal flag script (probe 4 vs 5): flag=0 across
+        # navigation without Page.enable, flag=1 with it. This was the exact root cause of the
+        # persistent-hook capture returning empty after reload.
+        await self._send("Page.enable", {})
+        await self._send(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": _CONSOLE_OVERRIDE_JS},
+        )
+        # Install into the CURRENT document too, so live messages are captured from now.
+        await self._send(
+            "Runtime.evaluate",
+            {"expression": _CONSOLE_OVERRIDE_JS, "returnByValue": False},
+        )
+
+    async def _ws_url(self) -> str:
+        """Purpose: resolve the browser's WebSocket debugger URL (offloaded to a thread).
+
+        Args:
+            self (ConsoleCapture): Capture instance.
+
+        Returns:
+            str: ``ws://127.0.0.1:<port>/devtools/browser/<id>``.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ConsoleCapture._ws_url)
+            True
+            >>> callable(ConsoleCapture._ws_url)
+            True
+        """
+        version = await asyncio.to_thread(
+            lambda: json.load(urlopen(f"http://127.0.0.1:{self._port}/json/version", timeout=5))
+        )
+        return cast(str, version["webSocketDebuggerUrl"])
+
+    async def _send(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Purpose: send one session-scoped CDP call and await its response.
+
+        Args:
+            self (ConsoleCapture): Capture instance.
+            method (str): CDP method name.
+            params (dict[str, Any]): CDP method parameters.
+
+        Returns:
+            dict[str, Any]: The method's result object.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ConsoleCapture._send)
+            True
+            >>> callable(ConsoleCapture._send)
+            True
+        """
+        self._next_id += 1
+        call_id = self._next_id
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[call_id] = future
+        await self._websocket.send(
+            json.dumps(
+                {
+                    "id": call_id,
+                    "sessionId": self._session_id,
+                    "method": method,
+                    "params": params,
+                }
+            )
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=30)
+        finally:
+            self._pending.pop(call_id, None)
+
+    async def _pump(self) -> None:
+        """Purpose: drain the websocket, resolving pending calls and discarding events.
+
+        Args:
+            self (ConsoleCapture): Capture instance.
+
+        Returns:
+            None: Runs until the websocket closes or ``stop()`` cancels the task.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ConsoleCapture._pump)
+            True
+            >>> callable(ConsoleCapture._pump)
+            True
+        """
+        try:
+            async for raw in _messages(self._websocket):
+                response = json.loads(raw)
+                if response.get("sessionId") != self._session_id:
+                    continue
+                call_id = response.get("id")
+                if isinstance(call_id, int) and call_id in self._pending:
+                    future = self._pending[call_id]
+                    if not future.done():
+                        error = response.get("error")
+                        if error is not None:
+                            future.set_exception(
+                                RuntimeError(f"CDP_ERROR: {error.get('message', error)}")
+                            )
+                        else:
+                            future.set_result(response.get("result", {}))
+        except (TimeoutError, ConnectionError, json.JSONDecodeError) as error:
+            # The pump only keeps the session alive; a websocket drop at shutdown/timeout is
+            # expected (the daemon stops captures in `serve()`'s `finally`). The error is
+            # deliberately surfaced nowhere: pending calls get their own timeout from `_send`.
+            del error
+
+    async def entries(self, clear: bool = False) -> list[dict[str, Any]]:
+        """Purpose: read (and optionally wipe) the per-page console buffer.
+
+        Args:
+            self (ConsoleCapture): Capture instance.
+            clear (bool): Whether the buffer is emptied after reading.
+
+        Returns:
+            list[dict[str, Any]]: Captured message records from this target's page, in order.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ConsoleCapture.entries)
+            True
+            >>> callable(ConsoleCapture.entries)
+            True
+        """
+        result = await self._send(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "(() => { const m = window.__browserProxyConsole?.slice() ?? []; "
+                    f"if ({json.dumps(clear)}) {{ window.__browserProxyConsole.length = 0; }} "
+                    "return m; })()"
+                ),
+                "returnByValue": True,
+            },
+        )
+        value = result.get("result", {}).get("value", [])
+        return list(value) if isinstance(value, list) else []
+
+    async def stop(self) -> None:
+        """Purpose: detach the session, close the websocket, and cancel the pump task.
+
+        Args:
+            self (ConsoleCapture): Capture instance.
+
+        Returns:
+            None: Idempotent; safe to call more than once.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(ConsoleCapture.stop)
+            True
+            >>> callable(ConsoleCapture.stop)
+            True
+        """
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            try:
+                await asyncio.gather(self._pump_task, return_exceptions=True)
+            finally:
+                self._pump_task = None
+        if self._websocket is not None:
+            if self._session_id:
+                try:
+                    await self._send("Target.detachFromTarget", {"sessionId": self._session_id})
+                except (TimeoutError, ConnectionError, RuntimeError):
+                    pass  # best-effort teardown — the websocket is closed right after anyway
+            self._session_id = None
+            try:
+                await self._websocket.__aexit__(None, None, None)
+            except (TimeoutError, ConnectionError, RuntimeError):
+                pass  # best-effort teardown — already closing/closed are fine
+            self._websocket = None
+
+
+_CONSOLE_OVERRIDE_JS = r"""
+(() => {
+  if (window.__browserProxyConsole) return;
+  window.__browserProxyConsole = [];
+  const BUFFER = window.__browserProxyConsole;
+  const MAX = 2000;
+  for (const level of ["log", "warn", "error", "info", "debug"]) {
+    const original = console[level]?.bind(console);
+    console[level] = (...args) => {
+      try { BUFFER.push({ level, args: args.map(String), ts: Date.now() }); } catch {}
+      if (BUFFER.length > MAX) BUFFER.splice(0, BUFFER.length - MAX);
+      if (typeof original === "function") original(...args);
+    };
+  }
+})();"""
+"""Boot-time console override injected via ``Page.addScriptToEvaluateOnNewDocument`` — runs
+before every document's own scripts (hence capturing the FULL load sequence, not only
+post-install messages), wraps the real ``console.*`` methods (kept in passthrough), appends
+structured records to ``window.__browserProxyConsole`` (bounded at 2000), and is idempotent
+(guarded by the buffer's own existence)."""

@@ -17,7 +17,7 @@ from browser_proxy.actions import (
     windows_preview_for_targets,
 )
 from browser_proxy.bridge import ExtensionBridge
-from browser_proxy.cdp import CdpBrowser, is_read_only_method
+from browser_proxy.cdp import CdpBrowser, ConsoleCapture, is_read_only_method
 from browser_proxy import ipc
 from browser_proxy.models import Envelope, RpcRequest
 from browser_proxy.paths import (
@@ -65,6 +65,7 @@ class Daemon:
         """
         self._stop = asyncio.Event()
         self.bridge = ExtensionBridge()
+        self._console_captures: dict[tuple[str, str], ConsoleCapture] = {}
 
     async def serve(self) -> None:
         """Purpose: serve requests on systemd's or a private Unix socket until explicitly stopped.
@@ -106,6 +107,9 @@ class Daemon:
                 server.close()
                 await server.wait_closed()
             await self.bridge.stop()
+            for capture in list(self._console_captures.values()):
+                await capture.stop()
+            self._console_captures.clear()
             if activated is None:
                 local_socket.unlink(missing_ok=True)
             lock_path().unlink(missing_ok=True)
@@ -392,6 +396,34 @@ class Daemon:
             raise RuntimeError(f"EXTENSION_UNAVAILABLE: {profile} (malformed reply data)")
         return data
 
+    async def console_capture(self, profile: str, target_id: str) -> ConsoleCapture:
+        """Purpose: fetch or create the PERSISTENT console capture for one target in one profile.
+
+        Args:
+            self (Daemon): Daemon instance owning the capture registry.
+            profile (str): Managed Edge profile name.
+            target_id (str): CDP page target ID to capture console output from.
+
+        Returns:
+            ConsoleCapture: An already-started capture (its injected override survives reloads —
+            the session stays attached for the daemon's whole lifetime, keyed by
+            ``(profile, target_id)``). Each distinct ``(profile, target_id)`` pair gets at most one
+            capture; the daemon stops them all in ``serve()``'s ``finally``.
+
+        Examples:
+            >>> asyncio.iscoroutinefunction(Daemon.console_capture)
+            True
+            >>> callable(Daemon.console_capture)
+            True
+        """
+        key = (profile, target_id)
+        capture = self._console_captures.get(key)
+        if capture is None:
+            capture = ConsoleCapture(edge_cdp_port(profile), target_id)
+            await capture.start()
+            self._console_captures[key] = capture
+        return capture
+
     async def _approve(
         self, action: str, payload: dict[str, Any]
     ) -> tuple[dict[str, Any], str, bool]:
@@ -459,6 +491,42 @@ class Daemon:
         if not isinstance(edited, dict):
             raise PermissionError("APPROVAL_REJECTED")
         return edited, str(data.get("comment", "")), edited != payload
+
+    def _is_raw_read_only(self, protocol: str, method: str) -> bool:
+        """Purpose: decide whether one `raw` operation is read-only and therefore bypasses
+        approval — protocol-aware, mirroring `is_read_only_method` across ALL three families.
+
+        Args:
+            self (Daemon): Daemon instance (stateless for this decision).
+            protocol (str): Normalized family — ``cdp-browser``, ``cdp-page``, or ``ext``.
+            method (str): Dotted method name as passed in the raw payload.
+
+        Returns:
+            bool: ``True`` for known read-only methods of that family: CDP browser-level methods
+            on the existing allowlist (``Browser.getVersion``, ``Target.getTargets``, ...); CDP
+            page-level ``Runtime.evaluate``/``Runtime.getProperties``/``Runtime.callFunctionOn``
+            read-only family; and read-only ``chrome.*`` methods (``*query``/``*get*``/``*list*``
+            pattern). Everything else requires approval — fail-closed by default, open only for
+            structurally read-only names.
+
+        Examples:
+            >>> Daemon()._is_raw_read_only('cdp-browser', 'Browser.getVersion')
+            True
+            >>> Daemon()._is_raw_read_only('ext', 'bookmarks.getTree')
+            True
+        """
+        if protocol == "cdp-browser":
+            return is_read_only_method(method)
+        if protocol == "cdp-page":
+            return method in {
+                "Runtime.evaluate",
+                "Runtime.getProperties",
+                "Runtime.callFunctionOn",
+                "DOM.describeNode",
+            }
+        if protocol == "ext":
+            return method.endswith(("query", "getTree")) or ".get" in method
+        return False
 
     async def _target_approval_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Purpose: enrich ANY approval payload carrying CDP ``target_id``/``target_ids`` with
@@ -555,8 +623,9 @@ class Daemon:
                     raise ValueError(f"preflight requires {field}")
             comment, edited = "", False
             raw_method = str(payload.get("method", ""))
+            raw_protocol = str(payload.get("protocol", "cdp-browser")).strip().lower()
             requires_approval = action.policy.approval or (
-                action.name == "raw" and not is_read_only_method(raw_method)
+                action.name == "raw" and not self._is_raw_read_only(raw_protocol, raw_method)
             )
             if requires_approval:
                 approval_payload = await self._target_approval_preview(payload)

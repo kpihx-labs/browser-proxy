@@ -91,6 +91,14 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
     "page-back": {"profile": "default", "target_id": "<target-id>"},
     "page-forward": {"profile": "default", "target_id": "<target-id>"},
     "page-click": {"profile": "default", "target_id": "<target-id>", "selector": "#submit"},
+    "page-click-coordinates": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "x": 91.5,
+        "y": 312.3,
+        "button": "left",
+        "click_count": 2,
+    },
     "page-hover": {"profile": "default", "target_id": "<target-id>", "selector": "#menu"},
     "page-type": {
         "profile": "default",
@@ -135,6 +143,12 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "key": "theme",
         "value": "dark",
     },
+    "storage-local-remove": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "keys": ["theme"],
+    },
+    "storage-local-clear": {"profile": "default", "target_id": "<target-id>"},
     "browser-ask-user": {"profile": "default", "question": "Continue?"},
     "browser-dismiss-overlays": {"profile": "default"},
     "browser-solve-captcha": {"profile": "default", "action": "detect"},
@@ -148,7 +162,12 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "mime_type": "text/plain",
     },
     "browser-get-new-tab": {"profile": "default", "timeout_seconds": 15},
-    "raw": {"profile": "default", "method": "Target.getTargets", "params": {}},
+    "raw": {
+        "profile": "default",
+        "protocol": "cdp-browser",
+        "method": "Target.getTargets",
+        "params": {},
+    },
 }
 
 EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
@@ -470,6 +489,15 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
         "selector": "#submit",
         "clicked": True,
     },
+    "page-click-coordinates": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "x": 91.5,
+        "y": 312.3,
+        "button": "left",
+        "click_count": 2,
+        "clicked": True,
+    },
     "page-hover": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -522,6 +550,13 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
         "key": "theme",
         "set": True,
     },
+    "storage-local-remove": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "keys": ["theme"],
+        "removed": True,
+    },
+    "storage-local-clear": {"profile": "default", "target_id": "<target-id>", "cleared": True},
     "browser-ask-user": {"answer": "yes"},
     "browser-dismiss-overlays": {"dismissed": 1},
     "browser-solve-captcha": {"detected": False, "clicked": False},
@@ -529,7 +564,12 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
     "browser-set-combobox": {"matched": True},
     "browser-drop-file": {"dropped": True},
     "browser-get-new-tab": {"tab_id": 12, "url": "https://example.com"},
-    "raw": {"profile": "default", "method": "Target.getTargets", "result": {"targetInfos": []}},
+    "raw": {
+        "profile": "default",
+        "protocol": "cdp-browser",
+        "method": "Target.getTargets",
+        "result": {"targetInfos": []},
+    },
 }
 
 
@@ -561,6 +601,7 @@ FIELD_NOTES: dict[str, str] = {
     "secure": "Whether the cookie requires HTTPS. Defaults to `true`.",
     "http_only": "Whether JavaScript cannot read the cookie. Defaults to `false`.",
     "key": "localStorage key.",
+    "keys": "Non-empty list of localStorage keys to remove in ONE call, never one call per key.",
     "tab_ids": "Real numeric Edge tab IDs to group.",
     "title": "Human-visible tab-group or bookmark title.",
     "color": "Edge tab-group color.",
@@ -573,8 +614,10 @@ FIELD_NOTES: dict[str, str] = {
     "content_base64": "Base64-encoded file bytes supplied inline; no extension filesystem access.",
     "mime_type": "File MIME type. Defaults to `application/octet-stream`.",
     "timeout_seconds": "Maximum wait for the next created tab. Defaults to `15`.",
-    "method": "Browser-level Chrome DevTools Protocol method.",
-    "params": "Object-valued Chrome DevTools Protocol parameters.",
+    "method": "Browser-level Chrome DevTools Protocol method — or, for `ext`, a dotted chrome.* path (`bookmarks.getTree`); for `cdp-page`, a page-domain method (`Runtime.evaluate`).",
+    "params": "Object-valued protocol parameters (or, for `ext`, an ARRAY of positional arguments).",
+    "protocol": "Protocol family: `cdp-browser` (default), `cdp-page`, or `ext`.",
+    "calls": "Ordered list of `[method, params]` pairs for `cdp-page` — executed sequentially within ONE attached page session.",
     "tab_id": "Real numeric chrome.tabs.Tab ID (never a CDP target_id) to update/reposition.",
     "index": "Absolute destination position: `0` is first, `-1` is last.",
     "before_tab_id": "Move immediately before this real tab ID; its index is resolved server-side.",
@@ -611,6 +654,7 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "page-navigate": ("wait_seconds",),
     "page-reload": ("ignore_cache", "wait_seconds"),
     "page-type": ("clear",),
+    "page-click-coordinates": ("button", "click_count"),
     "page-scroll": ("selector", "x", "y"),
     "page-evaluate": ("await_promise",),
     "page-screenshot": ("format", "output"),
@@ -640,8 +684,19 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
-    ("page-console-list", "clear"): "Whether the captured console buffer is cleared after reading.",
+    (
+        "page-console-list",
+        "clear",
+    ): "Whether the captured console buffer is cleared after reading. The capture is PERSISTENT — injected via `Page.addScriptToEvaluateOnNewDocument` so it survives reloads and captures the page's own boot logs; the daemon holds one long-lived attached session per (profile, target_id) (`DaemonContext.console_capture`).",
     ("page-evaluate", "await_promise"): "Whether an expression returning a Promise is awaited.",
+    (
+        "page-click-coordinates",
+        "button",
+    ): 'Mouse button: `"left"` (default), `"middle"`, `"right"`, `"back"`, or `"forward"`.',
+    (
+        "page-click-coordinates",
+        "click_count",
+    ): "Number of press/release pairs: `1` (default) for a plain click, `2` for a double-click, etc.",
     ("cookie-set", "path"): "Cookie path. Defaults to `/`.",
     ("group-update", "collapsed"): "Whether the Edge tab group is collapsed.",
     (
@@ -752,12 +807,16 @@ def _type_name(value: Any) -> str:
         'str'
         >>> _type_name({"key": "value"})
         'dict'
+        >>> _type_name(91.5)
+        'number'
     """
 
     if isinstance(value, bool):
         return "bool"
     if isinstance(value, int):
         return "int"
+    if isinstance(value, float):
+        return "number"
     if isinstance(value, list):
         return "list"
     if isinstance(value, dict):

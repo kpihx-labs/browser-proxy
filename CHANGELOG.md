@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0 - 2026-08-30
+
+- **3 live-verified bugs found and fixed during a full real-site test sweep of all 7 HITL actions
+  (KπX: "corrige tots els desync partotu code contract")**: (1) `cookie-remove` read the raw CDP
+  target as `["id"]` instead of the real `["targetId"]` — a `KeyError` masked by a mock matching
+  the bug and by the one live attempt failing earlier at the extension-approval step, never
+  reaching that line; (2) `page-evaluate` crashed with `CDP_ERROR: Object reference chain is too
+  long` on any expression returning a non-serializable value (e.g. `window.open(...)`) — now
+  retries without `returnByValue`, returning a safe description instead; (3)
+  `browser-dismiss-overlays`'s accept-text regex used bare substring search, so `ok` matched inside
+  an unrelated "JEUX SUDOKU" nav link and clicked it instead of the real "Accepter" button on a real
+  multi-layer consent flow — fixed with word boundaries + a `<button>`-over-`<a>` preference.
+- **`browser-solve-captcha`'s `click_checkbox` now dispatches a REAL CDP-level click** instead of
+  an always-ineffective same-origin content-script click (live-verified: reCAPTCHA's anchor iframe
+  is served cross-origin from `www.google.com` in every real deployment). The extension reports the
+  iframe's own rect + tab url; the daemon resolves the CDP `target_id` and reuses
+  `page-click-coordinates`'s own `Input.dispatchMouseEvent` primitive. Live-verified against the
+  official Google demo: the checkbox now shows a genuine green checkmark.
+
 ## 0.5.0 - 2026-08-29
 
 - **HITL transparency, redirection, and one-shot reorganization (KπX directives, all live-verified

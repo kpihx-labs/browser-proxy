@@ -42,12 +42,14 @@ def test_registry_covers_the_restored_page_control_action_surface() -> None:
     assert {
         "page-navigate",
         "page-click",
+        "page-click-coordinates",
         "page-evaluate",
         "cookie-list",
         "browser-ask-user",
     } <= set(REGISTRY)
     assert REGISTRY["cookie-set"].policy.approval is True
     assert REGISTRY["page-evaluate"].policy.approval is False
+    assert REGISTRY["page-click-coordinates"].policy.approval is False
 
 
 def test_readiness_does_not_require_edge(tmp_path: Path, monkeypatch) -> None:

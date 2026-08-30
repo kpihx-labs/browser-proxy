@@ -366,26 +366,26 @@ afterward rather than assuming the click from `page-click` alone was sufficient.
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `page-evaluate` | `Runtime.evaluate` (arbitrary JS, `returnByValue`) | ❌ | same trust model as `raw`'s pre-existing `Runtime.evaluate` allowlist entry |
+| `page-evaluate` | `Runtime.evaluate` (arbitrary JS, `returnByValue`) | ❌ | same trust model as `raw`'s pre-existing `Runtime.evaluate` allowlist entry. 🛠 KπX, GRAVÉ — live-verified: an expression evaluating to a non-JSON-serializable value (e.g. `window.open(...)` returns a circular-reference `Window`) always failed with `CDP_ERROR: Object reference chain is too long`; now retried once without `returnByValue`, returning a safe `description`/`type` string (e.g. `"Window"`) instead of crashing the whole call |
 | `page-snapshot` | `Accessibility.enable` + `Accessibility.getFullAXTree` in ONE attached session (why `page_session` exists — enable-state cannot survive `page_call`'s per-call detach) | ❌ | |
-| `page-screenshot` | `Page.captureScreenshot` | ❌ | `output` path writes decoded bytes instead of returning base64 |
+| `page-screenshot` | `Page.captureScreenshot` | ❌ | payload optional `format` (`png`\|`jpeg`, default `png`) and optional `output` — when `output` is given, the decoded bytes are written to that local file and the RESULT carries `{"path": ...}`; otherwise the RESULT carries the base64 `data`. 🛠 Field alignment (fixed): the result uses `path` (never a second field named `output`), matching `doc.py`/the live CLI — the CONTRACT's old "`output` path writes" phrasing conflated the payload field with the result field |
 | `page-query` | `DOM.getDocument`→`DOM.querySelectorAll`→`DOM.describeNode` (batched per match) | ❌ | |
-| `page-console-list` | `Runtime.evaluate` — lazily installs a `console.*` override writing to `window.__browserProxyConsole`, then reads (+optionally clears) it | ❌ | best-effort: only captures messages emitted after first install on that page, no native CDP `Log`/`Runtime` event listener exists in this architecture |
-| `page-network-list` | `Runtime.evaluate` — `performance.getEntriesByType('resource'|'navigation')` | ❌ | Timing API only: no response bodies/headers (no CDP `Network` domain listener) |
+| `page-console-list` | **PERSISTENT** hook: daemon-held attached session (`DaemonContext.console_capture` → `cdp.ConsoleCapture`) installs `Page.addScriptToEvaluateOnNewDocument` (boot-time override capturing BEFORE the page's own scripts, real `console.*` kept in passthrough, buffer bounded at 2000) + installs it in the current document too, then reads (`window.__browserProxyConsole`) and optionally clears | ❌ | 🛠 limitation REMOVED (KπX, GRAVÉ: "comment avoir les logs meme quand deja charge ?"): the old per-call `Runtime.evaluate` override died with its detached session, so an already-loaded page permanently returned `[]` on first read. Now the hook survives reloads (the session stays attached for the daemon's whole lifetime): first call installs + captures live messages; a subsequent `page-reload` produces the FULL boot log sequence on the next read. One capture per `(profile, target_id)`, all stopped in `serve()`'s `finally` |
+| `page-network-list` | `Runtime.evaluate` — `performance.getEntriesByType('resource'|'navigation')` | ❌ | RESULT field is `requests` (a list of `{name, initiatorType, duration, transferSize, responseStatus}` — documented, not `resources`); Timing API only: no response bodies/headers (no CDP `Network` domain listener) |
 
 #### Dialogs
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `page-dialog-policy` | `Runtime.evaluate` — overrides `window.alert/confirm/prompt` to auto-resolve | ❌ | does not survive a future full navigation (no `Page.addScriptToEvaluateOnNewDocument` persistent session) |
+| `page-dialog-policy` | `Runtime.evaluate` — overrides `window.alert/confirm/prompt` to auto-resolve | ❌ | **Correct sequence (KπX, GRAVÉ — live-verified):** (1) navigate/reload to target page first, (2) install policy, (3) trigger alert. Installing BEFORE reload loses the override. `Runtime.evaluate` does not survive a page load — no `Page.addScriptToEvaluateOnNewDocument` persistent session is used. Also accepts optional `prompt_text` for auto-filling `prompt()` dialogs. |
 
 #### Cookies (browser-level, no `target_id`)
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `cookie-list` | `Network.getCookies` | ❌ | |
-| `cookie-set` | `Network.setCookie` | ✅ verify `name` | |
-| `cookie-remove` | `Network.deleteCookies` | ✅ preflight `name`,`domain` | |
+| `cookie-list` | `Storage.getCookies` | ❌ | profile-wide cookies, no page session needed |
+| `cookie-set` | `Storage.setCookies` | ✅ verify `name` | 🛠 backend fixed (KπX, GRAVÉ — live-verified): `Network.setCookie` → `CDP_ERROR: wasn't found` (page-only domain); `Storage.setCookie` (singular) → also doesn't exist at browser level; correct backend is `Storage.setCookies` (plural), which REQUIRES the cookie's `url` field for categorization (scheme derived from `secure` flag). Each call is a 1-element list. |
+| `cookie-remove` | `Network.deleteCookies` (via page session) | ✅ preflight `name`,`domain` | 🛠 backend fixed (same pass): `Storage.deleteCookies` does not exist at browser level. `Network.deleteCookies` requires a per-page session, so the daemon picks the profile's first live page target via `browser.targets()` + `browser.page_session()`. Cookies are profile-shared, so deleting through any page removes the cookie for the whole profile. |
 
 #### Storage
 
@@ -393,14 +393,16 @@ afterward rather than assuming the click from `page-click` alone was sufficient.
 |---|---|---|---|
 | `storage-local-get` | `Runtime.evaluate` (`localStorage.getItem`/`Object.fromEntries`) | ❌ | ⚠️ localStorage can hold session/auth tokens — caller responsible, same caveat as `page-evaluate`/`raw` |
 | `storage-local-set` | `Runtime.evaluate` (`localStorage.setItem`) | ✅ | |
+| `storage-local-remove` | `Runtime.evaluate` (`localStorage.removeItem`, batch) | ✅ preflight `keys` | 🆕 completes the symmetric storage/cookie action pair (KπX, live-verified `getItem`/`setItem` had no `removeItem`/`clear` counterpart; probed live via `page-evaluate` before building this dedicated action); accepts a batch `keys` list — never one call per key |
+| `storage-local-clear` | `Runtime.evaluate` (`localStorage.clear`) | ✅ | 🆕 same completion pass; wipes the WHOLE origin's localStorage in one call |
 
 #### Human-in-the-loop (extension-mediated — no `@require_approval`: the extension overlay itself IS the human gate)
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
 | `browser-ask-user` | bridge kind `user.ask` | none needed | overlay text/password input |
-| `browser-dismiss-overlays` | bridge kind `overlay.dismiss` | none needed | heuristic cookie-banner/modal dismissal |
-| `browser-solve-captcha` | bridge kind `captcha.solve` | none needed | best-effort: checkbox click only, image-grid solving explicitly not implemented |
+| `browser-dismiss-overlays` | bridge kind `overlay.dismiss` | none needed | heuristic cookie-banner/modal dismissal. 🛠 KπX, GRAVÉ — live-verified real-world bug: the accept-text match used bare substring search (`/accept\|agree\|got it\|ok/iu`), so `ok` matched inside an unrelated word (`"JEUX SUDOKU"` navigation link literally contains `"ok"`) and got clicked instead of the real "Accepter" button on a real multi-layer consent flow, navigating away from the page. Fixed with word boundaries around the substring-prone short terms (`\bagree\b`, `\bgot it\b`, `\bok\b` — `accept` deliberately keeps only a LEADING boundary so `Accepter`/`j'accepte` still match) plus a `<button>`-over-`<a>`, shortest-text-first preference when several candidates match |
+| `browser-solve-captcha` | bridge kind `captcha.solve`, `click_checkbox` escalates to a REAL CDP `Input.dispatchMouseEvent` (`page-click-coordinates`'s own primitive) | none needed | 🛠 KπX, GRAVÉ — live-verified against the official Google reCAPTCHA demo: reCAPTCHA's anchor iframe is served from `www.google.com`, cross-origin to every real deployment, so the previous same-origin-only content-script click never reached the checkbox (`clicked: true` was reported but the box stayed unchecked). The extension now reports the iframe's own bounding `rect` + the tab's `url` instead of attempting that click; the daemon correlates `url` against `browser.targets()` to resolve the CDP `target_id`, computes the checkbox's stable click point (~30px from the iframe's left edge, vertically centered — stable regardless of theme/width), and dispatches a real compositor-level click. Live-verified: the checkbox shows a genuine green checkmark after this call. `click_grid` (image challenges) remains explicitly not implemented |
 | `browser-set-date` | bridge kind `form.set_date` | none needed | native `<input type=date>` only, no MUI/AntD |
 | `browser-set-combobox` | bridge kind `form.set_combobox` | none needed | heuristic, no MUI/AntD |
 | `browser-drop-file` | bridge kind `form.drop_file` | none needed | content supplied inline (base64) by the caller — extension has no filesystem access |
@@ -410,17 +412,80 @@ afterward rather than assuming the click from `page-click` alone was sufficient.
 
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
-| `raw` | any BROWSER-LEVEL CDP `method`+`params`, verbatim (`CdpBrowser.call()` — flat WebSocket, NEVER `Target.attachToTarget`) | dynamic: `is_read_only_method()` allowlist (`Browser.getVersion`, `Target.getTargets`, `Target.getTargetInfo`, `Browser.getWindowForTarget`, `Browser.getWindowBounds`, `Page.getNavigationHistory`) bypasses approval; every other method is fail-closed extension-approved | escape hatch for anything not yet a first-class action — but ONLY for browser-level CDP domains |
+| `raw` | **THREE protocol families, protocol never frozen** (KπX, GRAVÉ: "il devrait permettre de faire tout ce que les autres do permettent et en plus d'autres choses... sans figer le protocole"): `cdp-browser` (`CdpBrowser.call()` — flat WebSocket, browser-level), `cdp-page` (`CdpBrowser.page_session()` — ONE attached per-page session, all page-scoped domains), `ext` (bridge kind `chrome.call` — dynamic `chrome.*` dispatch) | dynamic per-family: read-only allowlist bypasses approval; every other method is fail-closed extension-approved | `{"protocol":"cdp-browser"\|"cdp-page"\|"ext","method":...,"params":...}`; `protocol` defaults to `cdp-browser`. `cdp-page` adds required `target_id` + optional `calls` (ordered `[method, params]` list run sequentially in ONE attached session). `ext` accepts `params` as object (single arg) OR array (positional args). **Result is returned verbatim, any JSON shape** (dict/list/str/bool — never coerced, the old `isinstance(result, dict)` guard is gone) |
 
-**`raw` cannot reach page-level CDP domains — live-verified, not a theoretical limit.** `raw`'s
-backend (`CdpBrowser.call()`) connects directly to the browser-level CDP endpoint and never
-attaches a per-page session (`Target.attachToTarget`, which yields the `sessionId` every
-`Runtime.*`/`DOM.*`/`Input.*`/`Page.*` method requires to route to a specific renderer). Confirmed
-live: `raw {"method":"Runtime.evaluate","params":{"expression":"1+1"}}` fails unconditionally with
-`CDP_ERROR: 'Runtime.evaluate' wasn't found` — the method simply does not exist at that level, no
-matter the params or approval state. For anything page-scoped, use the dedicated `page-*` actions
-(they call `CdpBrowser.page_session()` instead, which DOES attach). `Runtime.evaluate` used to sit
-in `is_read_only_method()`'s allowlist despite this — purged as dead/misleading (see `cdp.py`).
+**The three families cover EVERYTHING the dedicated actions do, plus anything Chrome/CDP exposes.**
+
+| Family | Backend | Examples / raw result |
+|---|---|---|
+| `cdp-browser` (default) | `CdpBrowser.call()` — browser-level flat WS | `Target.getTargets`, `Browser.getVersion`, `Target.createTarget` — raw result object verbatim |
+| `cdp-page` | `CdpBrowser.page_session()` — attaches ONE flattened session per call | `Runtime.evaluate`, `DOM.getDocument`, `Input.dispatchMouseEvent`, `Page.navigate`, `Network.*`, `Accessibility.*`, `Emulation.*`, `CSS.*`... — the SAME domains every `page-*` action uses, but ANY method/params combo, plus multi-call `calls` bundles in one attach |
+| `ext` | bridge kind `chrome.call` — dynamic `chrome.*` resolution in `background.ts` (`handleChromeCall` + `chromeApiResultToJson`) | ANY chrome API the manifest's permissions expose: `bookmarks.getTree`, `tabs.query`, `windows.getAll`, `storage.local.get`, `management.getAll`... — result made JSON-safe (functions dropped, `Date`/`Error`/`Map`/`Set` normalized, circular refs flattened) |
+
+`protocol` values beyond these three fail with a clear `unknown protocol: ...` error — never a
+silent fallback. Only a tiny denylist stays hard-refused at the extension (`management.uninstall`,
+`runtime.reload`, `runtime.restart`, `runtime.setUninstallURL`, `runtime.requestUpdateCheck`): the
+platform-impossible user-gesture case and self-destructive bridge killers — everything else the
+permissions expose is reachable, and daemon-side approval policy is the only gate.
+
+**Policy per family (`Daemon._is_raw_read_only`):** `cdp-browser` uses the existing
+`is_read_only_method()` allowlist; `cdp-page` considers `Runtime.evaluate`/`getProperties`/
+`callFunctionOn`/`DOM.describeNode` read-only; `ext` treats any method ending in `query`/`getTree`
+or containing `.get` as read-only. Everything else requires approval — fail-closed by default,
+open only for structurally read-only names.
+
+### What `raw` can and cannot imitate — the definitive coverage map (KπX, GRAVÉ: analysis session
+### 2026-08-30, all ~63 dedicated actions audited against the 3 families)
+
+`raw` is the superset of the whole protocol surface: everything reachable via CDP-browser,
+CDP-page (single or `calls` bundle), or any `chrome.*` API the manifest exposes is imitable.
+
+**✅ Fully imitable (the large majority):** `page-evaluate`/`page-fill-form`/`page-select-option`/
+`page-scroll`/`page-console-list`/`page-network-list`/`page-dialog-policy` (same `Runtime.evaluate`
+backend), `page-snapshot` (bundle `calls`: `Accessibility.enable`+`getFullAXTree` in ONE session —
+persistent enable-state), `page-query` (bundle), `page-click-coordinates` (bundle
+`Input.dispatchMouseEvent` — including `button`/`clickCount` right-click/double-click), cookies
+(`Network.getCookies`/`setCookie`/`deleteCookies`), storage (`localStorage` via evaluate),
+`page-navigate`/`reload`/`back`/`forward` (2 calls: navigate then readyState probe), tabs
+(`ext` `tabs.create/update/query`, `Target.getTargetInfo`, `Target.activateTarget`), windows
+(`Target.createTarget`/`closeTarget`, `ext` `windows.getAll`), groups (`ext` `tabs.group`/
+`tabGroups.update/move/query`/`tabs.ungroup`), bookmarks (`ext` `bookmarks.*`),
+extension-list/get/enable/disable (`ext` `management.*`),
+`extension-search` (multi-call but clumsy).
+
+**🟡 Partially imitable (feasible with loss or verbosity):**
+
+| Action | What is lost | How `raw` approximates it |
+|---|---|---|
+| `window-list`, `tab-list`, `group-list` | The enriched `chrome_layout`/group metadata = the extension-side canonical computation (`computeWindowLayouts()`), not a single chrome API | `ext` `windows.getAll` + `tabs.query` + `tabGroups.query` reconstruct the essentials, but never the exact paired shape |
+| `page-click`, `page-hover`, `page-type` (selector-based) | The quad→center computation requires a callable — `raw`'s `calls` bundle is JSON-only, no chained arithmetic | 2 calls: `DOM.getBoxModel`, then dispatch at coordinates computed by the caller |
+| `page-screenshot` (with `output=`) | The file write is daemon/CLI-side | `raw` returns the base64; the write is the caller's step |
+| `bookmark-list` (depth/root_id) | The client-side tree-walk | `ext` `bookmarks.getTree` raw, manual traversal |
+
+**❌ NOT imitable — and why (the four hard boundaries):**
+
+| Action(s) | Root cause | Resolution |
+|---|---|---|
+| `profile-list`, `profile-start`, `profile-remove` | systemd + daemon filesystem orchestration — not a browser protocol at all. `raw` only speaks CDP/chrome.*; a hypothetical 4th `admin` family would be raw calling the daemon → circular | None needed. Admin tier, outside "protocol" scope by design |
+| `window-save`, `window-restore`, `window-saved-list`, `window-saved-remove` | Daemon-side JSON persistence on disk — not a transmission operation | None needed. Persistence ≠ transport |
+| `browser-ask-user` | Human round-trip: `raw` is request-response and has no "human-typed text" response type | None — it IS the HITL mechanism, kept dedicated |
+| `browser-get-new-tab` | Event-driven: arm an `onCreated` listener + await — `raw` has zero event family | A future `raw-watch` (CDP streaming) would cover it |
+| `extension-reload` | Deliberately denylisted — `runtime.reload` would kill the very bridge carrying the request (same platform reason as `management.uninstall`) | None — intended behavior, documented, dedicated alternative exists |
+| `browser-drop-file` | base64→File→DataTransfer injection needs content-script page privileges; `chrome.call` returns API data, it cannot plant a file into a page | Workaround via `cdp-page` evaluate (in-page base64 decode) is fragile; unnecessary — the action exists |
+
+**Why `raw` structurally cannot imitate those four (`browser-ask-user`, `browser-get-new-tab`,
+`extension-reload`, `browser-drop-file`):** all three raw families are **synchronous
+request→response transports** with no side-channel: `cdp-browser`/`cdp-page` get one CDP result
+per request, `ext` (`chrome.call`) gets one chrome API result per request. Anything that needs
+(a) a *round trip to a human* (ask-user returns a typed answer, not API data), (b) *event
+listener arming then waiting* (get-new-tab observes a future OS event — there is no "await event"
+response type), (c) *a deliberate safety denylist* (extension-reload would terminate the transport
+itself mid-request — refusable by design, exactly like `management.uninstall`'s user-gesture
+platform rule), or (d) *content-script page injection rights* (drop-file plants a constructed
+File into live page JS — `chrome.call` can only return data from a chrome API, never execute in a
+web page's context with page privileges) falls outside the 3 families by construction. These are
+the irreducible residue of "everything protocol" — every other dedicated action is a convenience
+wrapper over something `raw` already reaches.
 
 ---
 
