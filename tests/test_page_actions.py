@@ -70,8 +70,9 @@ def test_all_new_page_actions_are_registered() -> None:
     # +1 (page-click-eval: atomic Runtime.evaluate-based bounding box resolution, eliminates
     # the race condition that affects page-click on dynamic pages) = 67;
     # +1 (page-click-eval counted in REGISTRY) = 68;
-    # +1 (page-press: CDP Input.dispatchKeyEvent for proper keyboard input) = 69 → 70.
-    assert len(REGISTRY) == 70
+    # +1 (page-press: CDP Input.dispatchKeyEvent for proper keyboard input) = 69;
+    # +1 (tab-close: split from window-close, closes specific tabs by target_ids) = 70 → 71.
+    assert len(REGISTRY) == 71
     assert "group-sync" not in REGISTRY
 
 
@@ -571,6 +572,8 @@ def test_window_create_builds_ordered_tab_and_group_items(monkeypatch, tmp_path)
     next_chrome_tab_id = iter(range(101, 110))
 
     async def call(self: CdpBrowser, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "Target.getTargets":
+            return {"targetInfos": []}
         if method == "Target.createTarget":
             target_id = next(next_target_id)
             created_targets.append({"target_id": target_id, "params": dict(params)})
@@ -714,21 +717,28 @@ async def _approve_as_is(
 
 
 def test_window_close_closes_multiple_targets_in_one_approval(monkeypatch, tmp_path) -> None:
-    """`window-close` accepts a `target_ids` LIST and closes every one of them via its own
+    """`window-close` accepts a `window_id` and closes every tab in that window via its own
     `Target.closeTarget` call, in ONE approval round-trip — regression guard for the KπX-directed
-    refonte from a singular `target_id` (root-caused live: too slow/tedious with repeated
-    single-target calls each needing its own approval)."""
+    refonte to close-by-window instead of close-by-target_ids (root-caused live: too slow/tedious
+    with repeated single-target calls each needing its own approval)."""
     closed: list[str] = []
 
     async def targets(self: CdpBrowser) -> list[dict[str, Any]]:
-        # No pre-existing tabs to correlate — the approval preview enrichment degrades to an
-        # empty windows list, never blocking the real close.
-        return []
+        return [
+            {"targetId": "t1", "type": "page"},
+            {"targetId": "t2", "type": "page"},
+            {"targetId": "t3", "type": "page"},
+        ]
 
     async def call(self: CdpBrowser, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        assert method == "Target.closeTarget"
-        closed.append(params["targetId"])
-        return {}
+        if method == "Browser.getWindowForTarget":
+            # t1 and t2 in window 100, t3 in window 200
+            wid = {"t1": 100, "t2": 100, "t3": 200}.get(params["targetId"], 0)
+            return {"windowId": wid, "bounds": {}}
+        if method == "Target.closeTarget":
+            closed.append(params["targetId"])
+            return {}
+        raise AssertionError(f"unexpected CDP method {method}")
 
     monkeypatch.setattr(CdpBrowser, "targets", targets)
     monkeypatch.setattr(CdpBrowser, "call", call)
@@ -742,27 +752,28 @@ def test_window_close_closes_multiple_targets_in_one_approval(monkeypatch, tmp_p
                 method="do",
                 params={
                     "action": "window-close",
-                    "payload": {"profile": "default", "target_ids": ["t1", "t2", "t3"]},
+                    "payload": {"profile": "default", "window_id": 100},
                 },
             )
         )
     )
 
     assert result.meta.status == "ok"
-    assert result.data["target_ids"] == ["t1", "t2", "t3"]
+    assert result.data["window_id"] == 100
+    assert result.data["target_ids"] == ["t1", "t2"]
     assert result.data["closed"] is True
-    assert closed == ["t1", "t2", "t3"]
+    assert closed == ["t1", "t2"]
 
 
-def test_window_close_rejects_empty_or_non_list_target_ids(monkeypatch, tmp_path) -> None:
-    """`target_ids` must be a non-empty list — a bare string or empty list fails closed with
+def test_window_close_rejects_missing_or_invalid_window_id(monkeypatch, tmp_path) -> None:
+    """`window_id` must be a valid integer — a missing or non-numeric value fails closed with
     VALIDATION_ERROR before any CDP call, never a silent no-op close."""
     monkeypatch.setattr(Daemon, "_approve", _approve_as_is)
     daemon = _daemon_with_profile(tmp_path, monkeypatch)
 
     for bad_payload in (
-        {"profile": "default", "target_ids": []},
-        {"profile": "default", "target_ids": "t1"},
+        {"profile": "default"},
+        {"profile": "default", "window_id": "not-a-number"},
     ):
         result = asyncio.run(
             daemon.dispatch(
@@ -780,7 +791,7 @@ def test_window_close_approval_preview_shows_first_and_last_tab_per_window(
 ) -> None:
     """The approval payload sent to `_approve` for `window-close` gains a `"context"` field — one
     readable line per REAL window touched, naming its first/last tab title — so a human can tell
-    WHICH window corresponds to which opaque `target_id` (root-caused live, KπX: "je ne connais pas
+    WHICH window corresponds to which opaque `window_id` (root-caused live, KπX: "je ne connais pas
     quel id correspond à quel windos ds le hitl de close... il faut que je vois aussi les 1ers et
     derns elts des windows en question"). Also a regression guard for the generalized
     `_target_approval_preview`: `window-close` is just ONE of the actions that reaches it."""
@@ -821,7 +832,7 @@ def test_window_close_approval_preview_shows_first_and_last_tab_per_window(
                 method="do",
                 params={
                     "action": "window-close",
-                    "payload": {"profile": "default", "target_ids": ["t1", "t2", "t3"]},
+                    "payload": {"profile": "default", "window_id": 100},
                 },
             )
         )
@@ -829,18 +840,14 @@ def test_window_close_approval_preview_shows_first_and_last_tab_per_window(
 
     assert result.meta.status == "ok"
     windows = captured_approval_payload["context"]
-    assert len(windows) == 2
-    window_100 = next(line for line in windows if line.startswith("window 100:"))
-    window_200 = next(line for line in windows if line.startswith("window 200:"))
+    assert len(windows) == 1
+    window_100 = windows[0]
     assert 'first: "First A"' in window_100
     assert 'last: "Last A"' in window_100
     assert "2/2 tabs to close" in window_100
-    assert 'first: "Only B"' in window_200
-    assert 'last: "Only B"' in window_200
-    assert "1/1 tabs to close" in window_200
     # The real handler still ran normally afterward — the preview enrichment never leaks into
     # the actual close result or blocks the real action.
-    assert result.data["target_ids"] == ["t1", "t2", "t3"]
+    assert result.data["target_ids"] == ["t1", "t2"]
 
 
 def test_target_approval_preview_also_covers_a_singular_target_id(monkeypatch, tmp_path) -> None:

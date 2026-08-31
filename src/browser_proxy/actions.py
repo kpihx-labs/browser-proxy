@@ -454,12 +454,15 @@ async def _window_list(payload: dict[str, Any], context: DaemonContext) -> dict[
 
     Args:
         payload (dict[str, Any]): Object containing a started ``profile`` name.
+            Use ``browser-proxy do window-list`` to list all Edge windows.
         context (DaemonContext): Daemon state used to resolve that profile and, when connected,
             the paired extension.
 
     Returns:
         dict[str, Any]: Profile name and one entry per REAL Edge window (``window_id``, ``bounds``,
-        ``tabs`` — the pre-existing raw CDP target list, unchanged shape) plus ``chrome_layout``:
+        ``tabs`` — the pre-existing raw CDP target list, unchanged shape), ``incognito`` (bool —
+        ``True`` when the window's first tab belongs to a non-default ``browserContextId``,
+        indicating an InPrivate window), plus ``chrome_layout``:
         ``{"tabs", "groups", "order"}`` from the SAME canonical computation ``group-list``/
         ``tab-update``/``group-add-tabs`` use (see ``profile_state``-style single-source discipline),
         with each chrome tab correlated to its CDP ``target_id`` (see ``_correlate_cdp_targets``).
@@ -471,10 +474,10 @@ async def _window_list(payload: dict[str, Any], context: DaemonContext) -> dict[
         identical to ``tab-list``) could never answer "which tab is in which window."
 
     Examples:
-        >>> _window_list.__name__
-        '_window_list'
-        >>> callable(_window_list)
-        True
+        >>> {"action": "window-list", "payload": {"profile": "default"}}
+        {"profile": "default", "windows": [{"window_id": 123, "incognito": False, ...}]}
+        >>> {"action": "window-list", "payload": {"profile": "default"}}
+        {"profile": "default", "windows": [{"window_id": 456, "incognito": True, ...}]}
     """
     name, browser = _profile(payload, context)
     order: list[int | None] = []
@@ -499,6 +502,16 @@ async def _window_list(payload: dict[str, Any], context: DaemonContext) -> dict[
     except RuntimeError:
         chrome_windows = {}
 
+    # Detect the default profile context (most common browserContextId across all targets).
+    # Windows whose first tab lives in a different context are InPrivate.
+    all_targets = await _page_targets(browser)
+    ctx_counts: dict[str, int] = {}
+    for t in all_targets:
+        ctx = t.get("browserContextId", "")
+        if ctx:
+            ctx_counts[ctx] = ctx_counts.get(ctx, 0) + 1
+    default_ctx: str | None = max(ctx_counts, key=lambda k: ctx_counts[k]) if ctx_counts else None
+
     windows: list[dict[str, Any]] = []
     for window_id in order:
         entry = grouped[window_id]
@@ -513,6 +526,12 @@ async def _window_list(payload: dict[str, Any], context: DaemonContext) -> dict[
                 "groups": chrome_layout.get("groups", {}),
                 "order": chrome_layout.get("order", []),
             }
+        # Determine incognito: the window is InPrivate if its first tab's context
+        # differs from the most common (default profile) context.
+        first_tab_ctx: str | None = None
+        if entry["tabs"]:
+            first_tab_ctx = entry["tabs"][0].get("browserContextId")
+        entry["incognito"] = bool(first_tab_ctx and first_tab_ctx != default_ctx)
         windows.append(entry)
     return {"profile": name, "windows": windows}
 
@@ -568,6 +587,16 @@ async def _create_window_tab(
     options: dict[str, Any] = {"url": url}
     if window_id is not None:
         options["windowId"] = window_id
+        # Auto-resolve browserContextId from an existing tab in this window so that
+        # tabs created in an InPrivate window land in the correct incognito context
+        # instead of silently falling back to the default profile context.
+        if browser_context_id is None:
+            existing_targets = await _page_targets(browser)
+            for t in existing_targets:
+                wid, _ = await _window_id_for_target(browser, t["targetId"])
+                if wid == window_id and t.get("browserContextId"):
+                    options["browserContextId"] = t["browserContextId"]
+                    break
     elif browser_context_id is not None:
         options["browserContextId"] = browser_context_id
     elif incognito:
@@ -792,25 +821,60 @@ async def _window_create(payload: dict[str, Any], context: DaemonContext) -> dic
 
 
 @require_approval
-@require_preflight("profile", "target_ids")
+@require_preflight("profile", "window_id")
 async def _window_close(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
-    """Purpose: close one or many Edge targets (tabs/windows) by CDP target identifier, in ONE call.
+    """Purpose: close an entire Edge window by closing all its tabs in ONE call.
+
+    Args:
+        payload (dict[str, Any]): Profile and required ``window_id`` — the real Edge window to close.
+            Use ``browser-proxy do window-close`` with ``window_id`` to close a whole window.
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: Profile, ``window_id`` closed, the ``target_ids`` of every tab that was
+        closed, and a confirmed close intent. Edge auto-closes the window when the last tab is
+        closed.
+
+    Examples:
+        >>> {"action": "window-close", "payload": {"profile": "default", "window_id": 123}}
+        {"profile": "default", "window_id": 123, "target_ids": ["t1", "t2"], "closed": True}
+        >>> {"action": "window-close", "payload": {"profile": "default", "window_id": 456}}
+        {"profile": "default", "window_id": 456, "target_ids": ["t3"], "closed": True}
+    """
+    name, browser = _profile(payload, context)
+    window_id = int(payload["window_id"])
+    targets = await _page_targets(browser)
+    closed: list[str] = []
+    for target in targets:
+        tid = target.get("targetId", "")
+        wid, _ = await _window_id_for_target(browser, tid)
+        if wid == window_id:
+            await browser.call("Target.closeTarget", {"targetId": tid})
+            closed.append(tid)
+    return {"profile": name, "window_id": window_id, "target_ids": closed, "closed": True}
+
+
+@require_approval
+@require_preflight("profile", "target_ids")
+async def _tab_close(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: close one or many Edge tabs by CDP target identifier, in ONE call.
 
     Args:
         payload (dict[str, Any]): Profile and required, non-empty ``target_ids`` list — closing
-            several tabs/windows across the profile is ONE deliberate command with ONE approval,
-            never N separate ``do window-close`` calls each needing its own approval round-trip
+            several tabs across the profile is ONE deliberate command with ONE approval,
+            never N separate ``do tab-close`` calls each needing its own approval round-trip
             (root-caused, KπX directive: too slow/tedious in practice, confirmed live).
+            Use ``browser-proxy do tab-close`` to close tabs by target ID.
         context (DaemonContext): Daemon state used to resolve the Edge profile.
 
     Returns:
         dict[str, Any]: Profile, the exact ``target_ids`` closed, and a confirmed close intent.
 
     Examples:
-        >>> _window_close.__name__
-        '_window_close'
-        >>> callable(_window_close)
-        True
+        >>> {"action": "tab-close", "payload": {"profile": "default", "target_ids": ["t1", "t2"]}}
+        {"profile": "default", "target_ids": ["t1", "t2"], "closed": True}
+        >>> {"action": "tab-close", "payload": {"profile": "default", "target_ids": ["t3"]}}
+        {"profile": "default", "target_ids": ["t3"], "closed": True}
     """
     name, browser = _profile(payload, context)
     target_ids = payload.get("target_ids")
@@ -1307,14 +1371,15 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
     Args:
         payload (dict[str, Any]): Profile, ``url``, optional ``new_window`` (bool — a genuinely new
             window instead of the current one), optional ``window_id`` (open directly in that
-            EXISTING window instead — mutually exclusive with ``new_window`` and ``incognito``),
-            optional ``incognito`` (bool — create in a disposable InPrivate context instead of the
-            profile's default; mutually exclusive with ``window_id``), optional ``group_id``
-            (add the new tab into that EXISTING group/folder the instant it is created), optional
-            ``wait_seconds`` (defaults to `10`, same convention as ``page-navigate``/``page-reload``
-            — how long to wait for the newly created tab's OWN initial load to reach
+            EXISTING window instead — mutually exclusive with ``new_window``; the tab inherits
+            the window's ``browserContextId`` automatically, so InPrivate windows receive
+            incognito tabs without any extra flag), optional ``group_id`` (add the new tab into
+            that EXISTING group/folder the instant it is created), optional ``wait_seconds``
+            (defaults to `10`, same convention as ``page-navigate``/``page-reload`` — how long
+            to wait for the newly created tab's OWN initial load to reach
             ``document.readyState === "complete"``), and at most one position hint
             (``index``/``before_tab_id``/``after_tab_id``, same convention as ``tab-update``).
+            Use ``browser-proxy do tab-create`` to create a tab.
         context (DaemonContext): Daemon state used to resolve the profile and, when ``group_id`` or
             a position is requested, the paired extension (to capture the real chrome tab id and
             apply the placement via the SAME ``tab.update`` mechanism ``tab-update`` uses).
@@ -1328,33 +1393,28 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
         ``window_id``/``group_id``/``index`` after that placement.
 
     Raises:
-        ValueError: Both ``new_window`` and ``window_id`` given (ambiguous intent), or
-            ``incognito`` combined with ``window_id`` (cannot add an incognito tab to an
-            existing normal window).
+        ValueError: Both ``new_window`` and ``window_id`` given (ambiguous intent).
 
     Notes:
         Deliberately NOT ``@require_approval`` (KπX directive, same rationale as
         ``window-create``): opening a tab in an always-visible managed Edge window is directly
         observable the instant it happens. Still preflight-``profile`` and verify-``url``.
+        The ``incognito`` parameter was removed (KπX): ``_create_window_tab`` now auto-resolves
+        the ``browserContextId`` from the target window, so ``browser-proxy do tab-create``
+        with a ``window_id`` pointing to an InPrivate window just works.
 
     Examples:
-        >>> _tab_create.__name__
-        '_tab_create'
-        >>> callable(_tab_create)
-        True
+        >>> {"action": "tab-create", "payload": {"profile": "default", "window_id": 123, "url": "https://example.com"}}
+        {"profile": "default", "target_id": "ABC123", "url": "https://example.com", "ready_state": "complete"}
+        >>> {"action": "tab-create", "payload": {"profile": "default", "new_window": True, "url": "https://example.com"}}
+        {"profile": "default", "target_id": "DEF456", "url": "https://example.com", "ready_state": "complete"}
     """
     name, browser = _profile(payload, context)
     url = str(payload.get("url", "about:blank"))
-    incognito = bool(payload.get("incognito", False))
     new_window = bool(payload.get("new_window", False))
     raw_window_id = payload.get("window_id")
     if new_window and raw_window_id is not None:
         raise ValueError("new_window and window_id are mutually exclusive")
-    if incognito and raw_window_id is not None:
-        raise ValueError(
-            "incognito and window_id are mutually exclusive "
-            "(cannot add an incognito tab to an existing normal window)"
-        )
     group_id = payload.get("group_id")
     position_fields = ("index", "before_tab_id", "after_tab_id")
     wants_position = any(payload.get(field) is not None for field in position_fields)
@@ -1369,7 +1429,6 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
         url,
         capture_chrome_id=needs_chrome_id,
         new_window=new_window,
-        incognito=incognito,
     )
     ready_state = ""
     for _ in range(max(1, int(wait_seconds / 0.2))):
@@ -3843,6 +3902,7 @@ REGISTRY = {
         _action("tab-list", "Tabs", _tab_list),
         _action("tab-get", "Tabs", _tab_get),
         _action("tab-create", "Tabs", _tab_create),
+        _action("tab-close", "Tabs", _tab_close),
         _action("tab-activate", "Tabs", _tab_activate),
         _action("tab-update", "Tabs", _tab_update),
         _action("group-list", "Groups", _group_list),

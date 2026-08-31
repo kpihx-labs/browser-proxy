@@ -11,7 +11,9 @@ import shutil
 from browser_proxy import config
 from browser_proxy.actions import (
     REGISTRY,
+    _page_targets,
     _profile,
+    _window_id_for_target,
     format_window_preview,
     validate_registry,
     windows_preview_for_targets,
@@ -566,6 +568,19 @@ class Daemon:
             target_ids = [str(value) for value in raw_target_ids]
         elif single_target_id not in (None, ""):
             target_ids = [str(single_target_id)]
+        elif "window_id" in payload:
+            try:
+                _, browser = _profile(payload, self)
+                targets = await _page_targets(browser)
+                window_id = int(payload["window_id"])
+                target_ids = []
+                for t in targets:
+                    tid = t.get("targetId", "")
+                    wid, _ = await _window_id_for_target(browser, tid)
+                    if wid == window_id:
+                        target_ids.append(tid)
+            except (RuntimeError, ValueError, KeyError):
+                return payload
         else:
             return payload
         try:

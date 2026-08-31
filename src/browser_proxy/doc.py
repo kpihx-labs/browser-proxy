@@ -26,7 +26,7 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "incognito": True,
         "layout": [{"type": "tab", "url": "https://httpbin.org/ip"}],
     },
-    "window-close": {"profile": "default", "target_ids": ["<target-id>"]},
+    "window-close": {"profile": "default", "window_id": 143985019},
     "window-sync": {
         "profile": "default",
         "window_id": 143985019,
@@ -53,6 +53,7 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "incognito": True,
         "url": "https://httpbin.org/ip",
     },
+    "tab-close": {"profile": "default", "target_ids": ["<target-id>"]},
     "tab-activate": {"profile": "default", "target_id": "<target-id>"},
     "tab-update": {
         "profile": "default",
@@ -218,6 +219,7 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
                     "windowState": "normal",
                 },
                 "tabs": [{"id": "<target-id>", "type": "page"}],
+                "incognito": False,
                 "chrome_layout": {
                     "tabs": [
                         {
@@ -242,7 +244,12 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
         "window_id": 143985019,
         "layout": [{"type": "tab", "url": "https://example.com", "target_id": "<target-id>"}],
     },
-    "window-close": {"profile": "default", "target_ids": ["<target-id>"], "closed": True},
+    "window-close": {
+        "profile": "default",
+        "window_id": 143985019,
+        "target_ids": ["<target-id>"],
+        "closed": True,
+    },
     "window-sync": {
         "window_id": 143985019,
         "state": "maximized",
@@ -311,6 +318,7 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
         "window_id": 143985019,
         "group_id": 1,
     },
+    "tab-close": {"profile": "default", "target_ids": ["<target-id>"], "closed": True},
     "tab-activate": {"profile": "default", "target_id": "<target-id>", "active": True},
     "tab-update": {
         "tab_id": 12,
