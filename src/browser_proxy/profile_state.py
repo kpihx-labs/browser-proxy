@@ -1,15 +1,15 @@
 """Single canonical profile-state description — the ONE place that computes disk identity,
 systemd activation, and real CDP reachability for one Edge profile.
 
-Used identically by `do profile-list` (`Daemon.profile_inventory()`), `admin edge status`
-(`cli.admin_edge_status`), and `Daemon.start_profile()`. Before this module existed, the same
+Used identically by `do profile-list` (`Daemon.profile_inventory()`), `admin profile status`
+(`cli.admin_profile_status`), and `Daemon.start_profile()`. Before this module existed, the same
 systemd `is-active` probe and CDP `Browser.getVersion` call were hand-duplicated in both
 `daemon.py` and `cli.py` — this is the fix: exactly one implementation, imported everywhere,
 so the two paths can never silently drift apart again.
 
 Examples:
-    >>> edge_unit_name('test')
-    'browser-proxy-edge@test.service'
+    >>> profile_unit_name('test')
+    'browser-proxy-profile@test.service'
     >>> asyncio.iscoroutinefunction(describe_edge_profile)
     True
 """
@@ -22,7 +22,7 @@ from browser_proxy.cdp import CdpBrowser
 from browser_proxy.paths import edge_cdp_port, edge_profile_dir, edge_profile_state
 
 
-def edge_unit_name(profile: str) -> str:
+def profile_unit_name(profile: str) -> str:
     """Purpose: build the templated Edge systemd unit name for one profile.
 
     Args:
@@ -32,29 +32,29 @@ def edge_unit_name(profile: str) -> str:
         str: Fully qualified templated systemd user unit name.
 
     Examples:
-        >>> edge_unit_name('test')
-        'browser-proxy-edge@test.service'
-        >>> edge_unit_name('research')
-        'browser-proxy-edge@research.service'
+        >>> profile_unit_name('test')
+        'browser-proxy-profile@test.service'
+        >>> profile_unit_name('research')
+        'browser-proxy-profile@research.service'
     """
 
-    return f"browser-proxy-edge@{profile}.service"
+    return f"browser-proxy-profile@{profile}.service"
 
 
-async def is_edge_unit_active(unit: str) -> bool:
+async def is_profile_unit_active(unit: str) -> bool:
     """Purpose: report whether a systemd-managed Edge instance is already active.
 
     Args:
         unit (str): Fully qualified templated systemd user unit, for example
-            ``browser-proxy-edge@test.service``.
+            ``browser-proxy-profile@test.service``.
 
     Returns:
         bool: ``True`` only when ``systemctl --user is-active`` reports ``active``.
 
     Examples:
-        >>> asyncio.iscoroutinefunction(is_edge_unit_active)
+        >>> asyncio.iscoroutinefunction(is_profile_unit_active)
         True
-        >>> callable(is_edge_unit_active)
+        >>> callable(is_profile_unit_active)
         True
     """
 
@@ -93,7 +93,7 @@ async def describe_edge_profile(name: str) -> dict[str, Any]:
 
     profile_dir = edge_profile_dir(name)
     port = edge_cdp_port(name)
-    active = await is_edge_unit_active(edge_unit_name(name))
+    active = await is_profile_unit_active(profile_unit_name(name))
     reachable = False
     try:
         await CdpBrowser(port).call("Browser.getVersion", {})

@@ -15,7 +15,7 @@ def test_bridge_does_not_create_an_untransferable_secret_implicitly(tmp_path, mo
     monkeypatch.setenv("BROWSER_PROXY_PERSISTENT_STATE_DIR", str(tmp_path / "state"))
     bridge = ExtensionBridge()
     assert bridge._token() == ""
-    assert not (tmp_path / "state/extension.token").exists()
+    assert not (tmp_path / "state/extension.env").exists()
 
 
 def test_bridge_pair_persists_the_operator_provided_secret(tmp_path, monkeypatch) -> None:
@@ -36,7 +36,7 @@ def test_bridge_pair_persists_across_a_simulated_ephemeral_runtime_wipe(
     monkeypatch.setenv("BROWSER_PROXY_STATE_DIR", str(tmp_path / "runtime"))
     secret = "extension-generated-pairing-secret"
     ExtensionBridge().pair(secret)
-    assert (tmp_path / "persistent-state/extension.token").exists()
+    assert (tmp_path / "persistent-state/extension.env").exists()
     assert not (tmp_path / "runtime").exists()
     # Simulate the runtime dir (tmpfs) being wiped by a reboot/logout — the secret must survive.
     (tmp_path / "runtime").mkdir(parents=True, exist_ok=True)
@@ -75,7 +75,7 @@ def test_bridge_rejects_bad_token_and_dispatches_request(tmp_path, monkeypatch) 
             with pytest.raises(ConnectionClosed):
                 await rejected.recv()
 
-        token = (tmp_path / "state/extension.token").read_text()
+        token = (tmp_path / "state/extension.env").read_text()
         async with connect(f"ws://127.0.0.1:{bridge.port}") as extension:
             await extension.send(
                 json.dumps(
@@ -125,7 +125,7 @@ def test_two_profiles_stay_isolated_and_are_never_answered_by_the_wrong_extensio
         bridge = ExtensionBridge(timeout_seconds=1)
         bridge.pair("shared-pairing-secret-1234567")
         await bridge.start()
-        token = (tmp_path / "state/extension.token").read_text()
+        token = (tmp_path / "state/extension.env").read_text()
 
         async def handshake(profile: str):
             connection = await connect(f"ws://127.0.0.1:{bridge.port}").__aenter__()

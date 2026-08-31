@@ -15,7 +15,7 @@ from browser_proxy.paths import (
     edge_profile_state,
     materialize_edge_profile,
 )
-from browser_proxy.profile_state import edge_unit_name
+from browser_proxy.profile_state import profile_unit_name
 
 
 def test_edge_cdp_port_is_deterministic_and_bounded() -> None:
@@ -42,8 +42,8 @@ def test_edge_profile_dir_nests_under_the_configured_root(
 
 def test_edge_unit_naming_is_a_single_template_per_profile() -> None:
     """Every profile maps to exactly one templated unit — no headless/visible split."""
-    assert edge_unit_name("test") == "browser-proxy-edge@test.service"
-    assert edge_unit_name("research") == "browser-proxy-edge@research.service"
+    assert profile_unit_name("test") == "browser-proxy-profile@test.service"
+    assert profile_unit_name("research") == "browser-proxy-profile@research.service"
 
 
 def test_edge_profile_state_distinguishes_not_declared_declared_and_initialized(
@@ -95,7 +95,7 @@ def test_profile_inventory_survives_a_fresh_daemon_and_reports_live_state(
     materialize_edge_profile("default")
 
     async def unit_active(unit: str) -> bool:
-        return unit == "browser-proxy-edge@default.service"
+        return unit == "browser-proxy-profile@default.service"
 
     async def call(self: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
         assert method == "Browser.getVersion"
@@ -104,7 +104,7 @@ def test_profile_inventory_survives_a_fresh_daemon_and_reports_live_state(
 
     from browser_proxy.cdp import CdpBrowser
 
-    monkeypatch.setattr("browser_proxy.profile_state.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.profile_state.is_profile_unit_active", unit_active)
     monkeypatch.setattr(CdpBrowser, "call", call)
     inventory = asyncio.run(Daemon().profile_inventory())
     assert inventory == [
@@ -151,7 +151,7 @@ def test_start_profile_reuses_an_already_active_systemd_unit(
         return {"product": "Microsoft Edge/140"}
 
     async def unit_active(unit: str) -> bool:
-        return unit == "browser-proxy-edge@test.service"
+        return unit == "browser-proxy-profile@test.service"
 
     def fake_run(argv: list[str], **_kwargs: Any) -> Any:
         started_calls.append(argv)
@@ -160,7 +160,7 @@ def test_start_profile_reuses_an_already_active_systemd_unit(
     from browser_proxy.cdp import CdpBrowser
 
     monkeypatch.setattr(CdpBrowser, "call", call)
-    monkeypatch.setattr("browser_proxy.daemon.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.daemon.is_profile_unit_active", unit_active)
     monkeypatch.setattr("browser_proxy.daemon.subprocess.run", fake_run)
 
     monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
@@ -194,7 +194,7 @@ def test_start_profile_starts_an_inactive_unit_then_polls(
     from browser_proxy.cdp import CdpBrowser
 
     monkeypatch.setattr(CdpBrowser, "call", call)
-    monkeypatch.setattr("browser_proxy.daemon.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.daemon.is_profile_unit_active", unit_active)
     monkeypatch.setattr("browser_proxy.daemon.subprocess.run", fake_run)
 
     monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
@@ -202,7 +202,7 @@ def test_start_profile_starts_an_inactive_unit_then_polls(
     port = asyncio.run(daemon.start_profile("test"))
     assert port == edge_cdp_port("test")
     assert edge_profile_dir("test").is_dir()
-    assert started_calls == [["systemctl", "--user", "start", "browser-proxy-edge@test.service"]]
+    assert started_calls == [["systemctl", "--user", "start", "browser-proxy-profile@test.service"]]
 
 
 def test_start_profile_surfaces_a_failed_systemctl_start(
@@ -215,12 +215,12 @@ def test_start_profile_surfaces_a_failed_systemctl_start(
 
     class _Result:
         returncode = 1
-        stderr = "Unit browser-proxy-edge@test.service not found."
+        stderr = "Unit browser-proxy-profile@test.service not found."
 
     def fake_run(argv: list[str], **_kwargs: Any) -> Any:
         return _Result()
 
-    monkeypatch.setattr("browser_proxy.daemon.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.daemon.is_profile_unit_active", unit_active)
     monkeypatch.setattr("browser_proxy.daemon.subprocess.run", fake_run)
 
     monkeypatch.setenv("BROWSER_PROXY_PROFILE_ROOT", str(tmp_path / "profiles"))
@@ -254,7 +254,7 @@ def test_describe_edge_profile_probes_cdp_unconditionally(
     async def call(self: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
         return {"product": "Microsoft Edge/140"}
 
-    monkeypatch.setattr("browser_proxy.profile_state.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.profile_state.is_profile_unit_active", unit_active)
     monkeypatch.setattr(CdpBrowser, "call", call)
     description = asyncio.run(describe_edge_profile("test"))
     assert description["systemd_active"] is False
@@ -281,7 +281,7 @@ def test_remove_profile_stops_an_active_unit_then_trashes_the_directory(
         calls.append(argv)
         return _Result()
 
-    monkeypatch.setattr("browser_proxy.daemon.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.daemon.is_profile_unit_active", unit_active)
     monkeypatch.setattr("browser_proxy.daemon.subprocess.run", fake_run)
     monkeypatch.setattr("browser_proxy.daemon.shutil.which", lambda _name: "/usr/bin/trash-put")
 
@@ -293,7 +293,7 @@ def test_remove_profile_stops_an_active_unit_then_trashes_the_directory(
         "trashed_path": str(profile_dir),
     }
     assert calls == [
-        ["systemctl", "--user", "stop", "browser-proxy-edge@test.service"],
+        ["systemctl", "--user", "stop", "browser-proxy-profile@test.service"],
         ["/usr/bin/trash-put", str(profile_dir)],
     ]
 
@@ -318,7 +318,7 @@ def test_remove_profile_refuses_to_permanently_delete_when_trash_put_is_missing(
     async def unit_active(unit: str) -> bool:
         return False
 
-    monkeypatch.setattr("browser_proxy.daemon.is_edge_unit_active", unit_active)
+    monkeypatch.setattr("browser_proxy.daemon.is_profile_unit_active", unit_active)
     monkeypatch.setattr("browser_proxy.daemon.shutil.which", lambda _name: None)
     with pytest.raises(RuntimeError, match="trash-put"):
         asyncio.run(Daemon().remove_profile("test"))

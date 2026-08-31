@@ -57,15 +57,25 @@ browser-proxy admin <command>                                              # lif
 
 | Command | Role | Backend — what actually runs | HITL |
 |---|---|---|---|
-| `admin status` | Persistent profile/socket/extension state | RPC `admin.status` → `{profiles, socket: str(socket_path()), extension_connected: bridge.connected, extension_connected_profiles: [...]}`; profiles are freshly discovered from disk via `profile_state.describe_edge_profile()`, each carrying `state`, `systemd_active`, `cdp_reachable`, and `extension_connected` (see `## Profile lifecycle management`) | ❌ |
-| `admin install` | Register the daemon as a user service | `systemctl --user link` + `enable` on `systemd/browser-proxy.service` | ❌ |
-| `admin start` | Start the daemon, verify with a ping | `systemctl --user start browser-proxy.service` then RPC `ping` | ❌ |
-| `admin stop` | Graceful daemon shutdown | `systemctl --user stop browser-proxy.service` | ❌ |
+| `admin status` | Global status of all services, files, symlinks, token, permissions | Daemon RPC + filesystem checks (service symlinks, persistent state dir, extension token, runtime dir) | ❌ |
+| `admin service install` | Register the daemon as a user service | `systemctl --user link` + `enable` on `services/browser-proxy.service` | ❌ |
+| `admin service start` | Start the daemon, verify with a ping | `systemctl --user start browser-proxy.service` then RPC `ping` | ❌ |
+| `admin service stop` | Graceful daemon shutdown | `systemctl --user stop browser-proxy.service` | ❌ |
+| `admin service restart` | Restart daemon (stop then start) | `shutdown` RPC + `systemctl --user restart` then ping | ❌ |
+| `admin service logs` | Show daemon journal logs | `journalctl --user -u browser-proxy.service -n 50` | ❌ |
+| `admin service purge` | Full daemon purge | Stop, disable, unlink service, remove runtime dir | ❌ |
+| `admin profile install` | Register the Edge profile unit template | `systemctl --user link` on `services/browser-proxy-profile@.service` (once per machine, not per profile) | ❌ |
+| `admin profile start <profile>` | Materialize then start one profile's Edge instance | `materialize_edge_profile(profile)` then `systemctl --user start browser-proxy-profile@<profile>.service` — **always opens a real, visible window** | ❌ |
+| `admin profile stop <profile>` | Stop one profile's Edge instance | `systemctl --user stop browser-proxy-profile@<profile>.service` | ❌ |
+| `admin profile restart <profile>` | Restart one profile's Edge instance | `systemctl --user restart browser-proxy-profile@<profile>.service` | ❌ |
+| `admin profile status <profile>` | Live profile health, all 4 axes | `profile_state.describe_edge_profile(profile)` (disk `state` + `systemctl is-active` + a real `CdpBrowser(port).call("Browser.getVersion", {})`, unconditionally — never gated on systemd's reported state) **plus** a best-effort daemon RPC for `extension_connected` (`null` if the daemon is genuinely unreachable; the other 3 axes never depend on it) | ❌ |
+| `admin profile logs <profile>` | Show profile journal logs | `journalctl --user -u browser-proxy-profile@<profile>.service -n 50` | ❌ |
+| `admin profile purge <profile>` | Purge one profile's Edge instance and directory | Stop unit, trash profile dir | ❌ |
 | `admin extension pair` | Store the extension-generated pairing secret | hidden terminal prompt (`typer.prompt(..., hide_input=True)`) → `ExtensionBridge().pair(secret)` → mode-0600 local file write; secret never prints, enters shell history, logs, or chat | ❌ |
-| `admin edge install` | Register the Edge unit template | `systemctl --user link` on `systemd/browser-proxy-edge@.service` (once per machine, not per profile) | ❌ |
-| `admin edge start <profile>` | Materialize then start one profile's Edge instance | `materialize_edge_profile(profile)` then `systemctl --user start browser-proxy-edge@<profile>.service` — **always opens a real, visible window** | ❌ |
-| `admin edge stop <profile>` | Stop one profile's Edge instance | `systemctl --user stop browser-proxy-edge@<profile>.service` | ❌ |
-| `admin edge status <profile>` | Live profile health, all 4 axes | `profile_state.describe_edge_profile(profile)` (disk `state` + `systemctl is-active` + a real `CdpBrowser(port).call("Browser.getVersion", {})`, unconditionally — never gated on systemd's reported state) **plus** a best-effort daemon RPC for `extension_connected` (`null` if the daemon is genuinely unreachable; the other 3 axes never depend on it) | ❌ |
+| `admin extension unpair` | Remove the stored extension pairing token | Deletes `extension.env` from persistent state dir | ❌ |
+| `admin extension status` | Report extension token health | Checks file existence, permissions (0600), masked token preview | ❌ |
+| `admin doctor` | Diagnose and fix common issues | Creates missing dirs/symlinks, fixes permissions | ❌ |
+| `admin purge` | Full system purge | Stop daemon, disable/unlink all services, trash all profiles, remove state/runtime dirs | ❌ |
 
 ### `browser-proxy do` — actions (JSON default, `-f table` for display only)
 
@@ -89,8 +99,8 @@ browser-proxy admin <command>                                              # lif
 | Action | Backend | Approval | Notes |
 |---|---|---|---|
 | `profile-list` | scans non-symlink directories under the profile root, then `profile_state.describe_edge_profile()` per entry, plus `extension_connected` from the live bridge | ❌ | Read-only: never creates directories or starts Edge; returns persistent path, `state` (`declared`/`initialized` — see `## Profile lifecycle management`), deterministic port, `systemd_active`, `cdp_reachable`, `extension_connected` |
-| `profile-start` | materializes `<profile root>/<name>`, then `systemctl --user is-active`/`start browser-proxy-edge@<profile>.service`, then polls `Browser.getVersion` until CDP answers | ❌ | Always opens a real, visible window if not already running; no daemon-memory shortcut |
-| `profile-remove` | stops `browser-proxy-edge@<profile>.service` if active, then `trash-put <profile_dir>` (resolved by absolute path via `shutil.which`, never the `rm` shell wrapper — a daemon subprocess is not guaranteed the same `$PATH`) | ❌ preflight `profile` only | **Never a permanent delete** — the profile directory (bookmarks, cookies, sessions) is moved to the KpihX trash, recoverable with `trash-restore`. Deliberately admin-tier, not extension-approval-gated: see `## Profile lifecycle management` for why. Fails closed (`PROFILE_UNAVAILABLE`) if the profile was never declared, or if `trash-put` is missing — never silently falls back to permanent deletion |
+| `profile-start` | materializes `<profile root>/<name>`, then `systemctl --user is-active`/`start browser-proxy-profile@<profile>.service`, then polls `Browser.getVersion` until CDP answers | ❌ | Always opens a real, visible window if not already running; no daemon-memory shortcut |
+| `profile-remove` | stops `browser-proxy-profile@<profile>.service` if active, then `trash-put <profile_dir>` (resolved by absolute path via `shutil.which`, never the `rm` shell wrapper — a daemon subprocess is not guaranteed the same `$PATH`) | ❌ preflight `profile` only | **Never a permanent delete** — the profile directory (bookmarks, cookies, sessions) is moved to the KpihX trash, recoverable with `trash-restore`. Deliberately admin-tier, not extension-approval-gated: see `## Profile lifecycle management` for why. Fails closed (`PROFILE_UNAVAILABLE`) if the profile was never declared, or if `trash-put` is missing — never silently falls back to permanent deletion |
 
 #### Windows
 
@@ -495,8 +505,8 @@ meant to be typed by a human or an agent) — they exist solely as `ExecStart=` 
 
 | Hidden command | Invoked by (`ExecStart=`) | Wraps `admin`/`do`? | What it actually does |
 |---|---|---|---|
-| `daemon` | `browser-proxy.service` | No — it **is** the server | Runs `Daemon().serve()`: opens the Unix socket, holds the exclusive lock, dispatches every `do`/`admin` request. `admin start`/every `do <action>` are thin clients talking to *this* process over the socket. |
-| `edge-launch <profile>` | `browser-proxy-edge@<profile>.service` | No — it **becomes** Edge | Resolves the deterministic port + profile dir, builds the Edge argv, then `os.execvp`s into the real `microsoft-edge` binary (replacing itself — systemd tracks Edge's real PID). `admin edge start/stop/status` and `Daemon.start_profile()` only ever `systemctl start/stop/is-active` this unit; neither calls `edge_launch()`'s logic directly. |
+| `daemon` | `browser-proxy.service` | No — it **is** the server | Runs `Daemon().serve()`: opens the Unix socket, holds the exclusive lock, dispatches every `do`/`admin` request. `admin service start`/every `do <action>` are thin clients talking to *this* process over the socket. |
+| `edge-launch <profile>` | `browser-proxy-profile@<profile>.service` | No — it **becomes** Edge | Resolves the deterministic port + profile dir, builds the Edge argv, then `os.execvp`s into the real `microsoft-edge` binary (replacing itself — systemd tracks Edge's real PID). `admin profile start/stop/status` and `Daemon.start_profile()` only ever `systemctl start/stop/is-active` this unit; neither calls `edge_launch()`'s logic directly. |
 
 ---
 
@@ -525,7 +535,7 @@ root, never `$XDG_RUNTIME_DIR`.
 | Daemon runtime dir | `$XDG_RUNTIME_DIR/browser-proxy` (`BROWSER_PROXY_STATE_DIR`) | ephemeral — see table above |
 | Unix socket | `<runtime dir>/browser-proxy.sock` | |
 | Daemon lock | `<runtime dir>/browser-proxy.lock` | |
-| Extension pairing secret | `<persistent state dir>/extension.token` (mode 0600, never printed) | generated visibly once by the extension Options page; operator transfers it through `admin extension pair`'s hidden terminal prompt; **persistent**, not tmpfs |
+| Extension pairing secret | `<persistent state dir>/extension.env` (mode 0600, never printed) | generated visibly once by the extension Options page; operator transfers it through `admin extension pair`'s hidden terminal prompt; **persistent**, not tmpfs |
 | Extension bridge port | `37291` (`BROWSER_PROXY_EXTENSION_PORT`) | loopback only |
 | Edge profile root | `~/.local/share/browser-proxy/profiles/` (`BROWSER_PROXY_PROFILE_ROOT`) | |
 | One Edge profile dir | `<profile root>/<name>` (`edge_profile_dir()`) | **Source of truth** for one persistent Chromium `--user-data-dir`; survives Edge, daemon, and machine restarts — see `## Profile identity` for the declared/initialized distinction |
@@ -549,12 +559,12 @@ where an unattended timeout is the right way to reclaim a daemon.
 **Current design:** `Daemon()` takes no lifecycle configuration at all — no `idle_seconds`, no
 `max_lifetime_seconds`, no environment variable for either (removing them was the fix, not making
 them configurable). `_await_explicit_stop()` is the ONLY stop path: it blocks on `self._stop`
-forever until the `shutdown` RPC sets it (`admin stop`). The systemd unit's own `RuntimeMaxSec=8h`
+forever until the `shutdown` RPC sets it (`admin service stop`). The systemd unit's own `RuntimeMaxSec=8h`
 was removed too — that was a second, independent automatic-timeout mechanism enforcing the exact
 same thing KπX rejected, just one layer lower. `Restart=on-failure`/`RestartSec=2` are unrelated
 (crash resilience, never fires against a healthy daemon) and stay.
 
-`admin stop` was ALSO fixed as part of this: it used to run only `systemctl --user stop
+`admin service stop` was ALSO fixed as part of this: it used to run only `systemctl --user stop
 browser-proxy.service`, which silently no-ops for a daemon systemd never launched (e.g. `make
 smoke`'s isolated test daemon) — root-caused a real hang once the idle-TTL fallback that used to
 mask this bug was removed. It now sends the real `shutdown` RPC over the daemon's own Unix socket
@@ -573,7 +583,7 @@ browser-proxy
         │
         ▼
 ┌───────────────────────────────┐        ┌──────────────────────────────────┐
-│ browser-proxy.service          │        │ browser-proxy-edge@<profile>     │
+│ browser-proxy.service          │        │ browser-proxy-profile@<profile>  │
 │  ExecStart: browser-proxy daemon│        │  .service (one per profile,      │
 │  = Daemon().serve()            │──CDP──▶│  ALWAYS visible)                 │
 │  Unix socket + policy engine   │  WS    │  ExecStart: browser-proxy         │
@@ -605,14 +615,14 @@ A profile has **4 independent axes** — never conflated, never computed twice d
 | Axis | Meaning | Computed by |
 |---|---|---|
 | disk identity | `not_declared`/`declared`/`initialized` (see states table below) | `paths.edge_profile_state()` |
-| systemd activation | is the templated unit currently `active`? | `profile_state.is_edge_unit_active()` |
+| systemd activation | is the templated unit currently `active`? | `profile_state.is_profile_unit_active()` |
 | CDP reachability | a REAL `Browser.getVersion` round-trip, attempted unconditionally (never gated on systemd's reported state — a real network probe is more trustworthy than trusting systemd as a proxy for it) | `profile_state.describe_edge_profile()` |
 | extension bridge | is THIS profile's extension currently handshaken? (per-profile, see `## Extension bridge identity`) | `Daemon.bridge.connected_profiles()` |
 
 **Root-caused bug (fixed twice over):** first, `discover_edge_profiles()`/`_profile()` used to
 treat "the directory exists" as "this is a real Edge profile" (see states table below). Second,
 the systemd+CDP probe logic for the first 3 axes was hand-duplicated in BOTH `daemon.py` (used by
-`profile-list`/`admin status`) AND `cli.py` (used by `admin edge status`) — two independently
+`profile-list`/`admin status`) AND `cli.py` (used by `admin profile status`) — two independently
 maintained copies that could silently drift apart. `profile_state.py` is now the single canonical
 module: `describe_edge_profile(name)` is the ONE implementation, imported by both call sites, so
 there is exactly one place to fix if the systemd/CDP contract ever changes.
@@ -628,7 +638,7 @@ workspace = heuristic organization inside one profile; never a profile name
 
 **Root-caused bug (fixed):** `discover_edge_profiles()`/`_profile()` used to treat "the directory
 exists" as "this is a real Edge profile." But `materialize_edge_profile()` (called by
-`admin edge start`/`profile-start` before launching systemd) only runs a bare `mkdir` — it
+`admin profile start`/`profile-start` before launching systemd) only runs a bare `mkdir` — it
 **declares** a directory, it does not make Edge treat it as initialized. A directory left behind by
 a failed `systemctl start`, or reserved ahead of time, is not a genuine Edge profile: only Edge
 itself, by actually booting against that `--user-data-dir` at least once, stamps it as real —
@@ -636,11 +646,11 @@ verified live: every one of 3 real browser-proxy profile directories contains a 
 at its root the instant Edge has run there, and a bare `mkdir`'d directory never does.
 
 `paths.edge_profile_state(path)` is now the **one** predicate, used identically everywhere
-(`profile-list`, `admin edge status`, `admin status`, `_profile()`):
+(`profile-list`, `admin profile status`, `admin status`, `_profile()`):
 
 | State | Meaning |
 |---|---|
-| `not_declared` | No such directory — `profile-start`/`admin edge start` has never run for this name |
+| `not_declared` | No such directory — `profile-start`/`admin profile start` has never run for this name |
 | `declared` | Directory exists (browser-proxy `mkdir`'d it) but Edge has never actually booted there (no `Local State`) — a failed start, or a reservation ahead of time |
 | `initialized` | Edge has genuinely started against this directory at least once (`Local State` present) — a real Edge profile |
 
@@ -656,7 +666,7 @@ cannot erase this disk-backed inventory (see `## Config` for the durability guar
 top-level profile directories — nobody intended to create two separate isolated Edge installs, the
 name was just typed with a different case once. The filesystem is case-sensitive; humans routinely
 are not. `materialize_edge_profile()` now refuses (`ValueError`, surfaced as `VALIDATION_ERROR` via
-`do profile-start`/`typer.BadParameter` via `admin edge start`) any name that collides
+`do profile-start`/`typer.BadParameter` via `admin profile start`) any name that collides
 case-insensitively with a DIFFERENT already-declared profile. Re-declaring the SAME profile again
 (e.g. restarting `default`) is never treated as a collision with itself.
 
@@ -672,12 +682,12 @@ fails closed (`PROFILE_UNAVAILABLE`) rather than silently falling back to a perm
 profile, exactly like the `Default`/`default` collision above) have no reachable extension to ask
 for approval in the first place. Safety instead comes from the mandatory named
 `@require_preflight("profile")` identity plus the trash-not-delete guarantee — the same admin-tier
-trust level as `admin edge start`/`stop`, not a content-mutation-inside-a-live-page action.
+trust level as `admin profile start`/`stop`, not a content-mutation-inside-a-live-page action.
 
 ```
-1. browser-proxy admin edge start default
+1. browser-proxy admin profile start default
    └─ materialize ~/.local/share/browser-proxy/profiles/default/
-       └─ systemctl --user start browser-proxy-edge@default.service
+       └─ systemctl --user start browser-proxy-profile@default.service
       └─ edge-launch default → execvp real msedge, port 38049, real window opens
 
 2. (manual, once) load browser-proxy-ext/ unpacked in that window. In its Options page click
@@ -686,7 +696,7 @@ trust level as `admin edge start`/`stop`, not a content-mutation-inside-a-live-p
    placed in shell history.
 
 3. browser-proxy do profile-start '{"profile":"default"}'
-   └─ systemctl --user is-active browser-proxy-edge@default.service → already active → skip start
+   └─ systemctl --user is-active browser-proxy-profile@default.service → already active → skip start
       └─ poll Browser.getVersion on port 38049 → ready → {"profile":"default","cdp_port":38049}
 
 4. browser-proxy do tab-create '{"profile":"default","url":"https://example.com"}'

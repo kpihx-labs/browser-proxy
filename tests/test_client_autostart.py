@@ -59,7 +59,7 @@ class _FakeWriter:
 
 def test_request_does_not_start_daemon_while_unit_is_still_deactivating(monkeypatch) -> None:
     """Regression guard (KπX root-caused live): while `systemctl --user is-active` reports
-    `deactivating` (an in-flight async `admin stop` teardown), the client must NOT issue a
+    `deactivating` (an in-flight async `admin service stop` teardown), the client must NOT issue a
     redundant `systemctl start` — doing so raced the OLD daemon's own socket unlink/rebind, leaving
     the socket PATH pointing at an orphaned, unlistened inode (`ECONNREFUSED` despite `systemctl
     status` reporting the unit "active"). Only once the unit genuinely settles (`inactive`) does

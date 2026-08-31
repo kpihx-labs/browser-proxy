@@ -151,7 +151,7 @@ def _profile(payload: dict[str, Any], context: DaemonContext) -> tuple[str, CdpB
         RuntimeError: ``PROFILE_UNAVAILABLE: ...`` when the profile was never declared (run
             ``profile-start`` first) or is declared but Edge has never actually started there yet
             (also run ``profile-start`` first) — uses the same ``edge_profile_state()`` predicate
-            as ``profile-list``/``admin edge status``/``admin status``, never a private ad hoc check.
+            as ``profile-list``/``admin profile status``/``admin status``, never a private ad hoc check.
 
     Examples:
         >>> _profile.__name__

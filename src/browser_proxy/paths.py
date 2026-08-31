@@ -116,13 +116,13 @@ def pairing_token_path() -> Path:
         (confirmed root cause of the "must perpetually re-pair" complaint).
 
     Examples:
-        >>> pairing_token_path().name
-        'extension.token'
+    >>> pairing_token_path().name
+    'extension.env'
         >>> pairing_token_path().parent == persistent_state_dir()
         True
     """
 
-    return persistent_state_dir() / "extension.token"
+    return persistent_state_dir() / "extension.env"
 
 
 def extension_port() -> int:
@@ -281,10 +281,10 @@ def edge_profile_state(path: Path) -> str:
     Returns:
         str: ``"not_declared"`` when the path is not a real directory (never `materialize`d);
         ``"declared"`` when browser-proxy created the directory but Edge has never actually booted
-        against it (no marker file yet — `admin edge start` may have failed after `mkdir`, or
+        against it (no marker file yet — `admin profile start` may have failed after `mkdir`, or
         `profile-start` has not run yet); ``"initialized"`` when Edge has genuinely started there
         at least once (``config.EDGE_PROFILE_MARKER_FILENAME`` present at the directory root). This
-        is the ONE predicate used identically by ``profile-list``, ``admin edge status``,
+        is the ONE predicate used identically by ``profile-list``, ``admin profile status``,
         ``admin status``, and ``_profile()`` — never a different ad hoc check in each place.
 
     Examples:

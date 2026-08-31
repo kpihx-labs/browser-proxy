@@ -174,7 +174,7 @@ class CdpBrowser:
                                 "systemctl",
                                 "--user",
                                 "start",
-                                f"browser-proxy-edge@{self.profile}.service",
+                                f"browser-proxy-profile@{self.profile}.service",
                             ],
                             check=False,
                         )

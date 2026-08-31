@@ -30,7 +30,11 @@ from browser_proxy.paths import (
     runtime_dir,
     socket_path,
 )
-from browser_proxy.profile_state import describe_edge_profile, edge_unit_name, is_edge_unit_active
+from browser_proxy.profile_state import (
+    describe_edge_profile,
+    profile_unit_name,
+    is_profile_unit_active,
+)
 
 _APPROVAL_BRIDGE_GRACE_SECONDS = 5.0
 """Extra seconds the daemon-side bridge wait adds ON TOP of the exact HITL timeout it tells the
@@ -52,7 +56,7 @@ class Daemon:
 
         Notes:
             Deliberately no idle TTL and no maximum lifetime (KπX directive): the daemon is
-            lançable/arrêtable purely on request — `admin start`/`admin stop`, or the OS itself —
+            lançable/arrêtable purely on request — `admin service start`/`admin service stop`, or the OS itself —
             never on an automatic timer. Every managed Edge window is already always visible, so
             KπX can directly see and close one an agent forgot; there is no case where an
             unattended timeout is the right way to reclaim it.
@@ -74,7 +78,7 @@ class Daemon:
             self (Daemon): Daemon instance owning lifecycle state and local transports.
 
         Returns:
-            None: Stops ONLY on an explicit ``admin stop``/``shutdown`` RPC (or the process being
+            None: Stops ONLY on an explicit ``admin service stop``/``shutdown`` RPC (or the process being
             killed) — no idle TTL, no maximum lifetime (KπX directive: purely lançable/arrêtable).
 
         Examples:
@@ -171,7 +175,7 @@ class Daemon:
 
         Returns:
             None: Raises the internal ``DAEMON_STOP`` signal once ``self._stop`` is set by the
-            ``shutdown`` RPC (``admin stop``).
+            ``shutdown`` RPC (``admin service stop``).
 
         Notes:
             Deliberately no idle TTL, no maximum lifetime (KπX directive, root-caused a real
@@ -239,8 +243,8 @@ class Daemon:
         """
         materialize_edge_profile(name)
         port = edge_cdp_port(name)
-        unit = edge_unit_name(name)
-        if not await is_edge_unit_active(unit):
+        unit = profile_unit_name(name)
+        if not await is_profile_unit_active(unit):
             started = await asyncio.to_thread(
                 subprocess.run,
                 ["systemctl", "--user", "start", unit],
@@ -317,8 +321,8 @@ class Daemon:
         profile_dir = edge_profile_dir(name)
         if edge_profile_state(profile_dir) == "not_declared":
             raise RuntimeError(f"PROFILE_UNAVAILABLE: {name} is not declared — nothing to remove")
-        unit = edge_unit_name(name)
-        was_active = await is_edge_unit_active(unit)
+        unit = profile_unit_name(name)
+        was_active = await is_profile_unit_active(unit)
         if was_active:
             await asyncio.to_thread(
                 subprocess.run,

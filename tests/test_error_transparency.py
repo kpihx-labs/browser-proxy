@@ -30,7 +30,7 @@ def test_extension_rejection_surfaces_the_real_message_as_its_own_code(
         daemon = Daemon()
         daemon.bridge.pair("shared-pairing-secret-1234567")
         await daemon.bridge.start()
-        token = (tmp_path / "state/extension.token").read_text()
+        token = (tmp_path / "state/extension.env").read_text()
         async with connect(f"ws://127.0.0.1:{daemon.bridge.port}") as connection:
             await connection.send(
                 json.dumps(
@@ -134,7 +134,7 @@ def test_disconnect_mid_flight_fails_the_pending_request_immediately_with_the_re
         bridge = ExtensionBridge(timeout_seconds=30)
         bridge.pair("shared-pairing-secret-1234567")
         await bridge.start()
-        token = (tmp_path / "state/extension.token").read_text()
+        token = (tmp_path / "state/extension.env").read_text()
         connection = await connect(f"ws://127.0.0.1:{bridge.port}").__aenter__()
         await connection.send(
             json.dumps(
@@ -175,7 +175,7 @@ def test_extension_timeout_is_a_distinct_code_from_extension_unavailable(
         bridge = ExtensionBridge(timeout_seconds=30)
         bridge.pair("shared-pairing-secret-1234567")
         await bridge.start()
-        token = (tmp_path / "state/extension.token").read_text()
+        token = (tmp_path / "state/extension.env").read_text()
         async with connect(f"ws://127.0.0.1:{bridge.port}") as connection:
             await connection.send(
                 json.dumps(

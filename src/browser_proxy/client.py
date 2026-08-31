@@ -32,7 +32,7 @@ async def _ensure_daemon_starting() -> bool:
         ``inactive``/``failed``/anything but ``activating``/``deactivating``); ``False`` while it
         is still transitioning, so the caller keeps waiting instead of stacking a redundant
         ``start``. Root-caused live (KπX): the previous unconditional ``start`` on every connection
-        failure raced an in-flight ``admin stop`` teardown — a second, genuinely new daemon process
+        failure raced an in-flight ``admin service stop`` teardown — a second, genuinely new daemon process
         could win the startup lock right as the OLD process was still unwinding its own listening
         socket, leaving the socket PATH pointing at an orphaned inode nobody was actually listening
         on (``ECONNREFUSED`` despite ``systemctl status`` reporting the unit "active").

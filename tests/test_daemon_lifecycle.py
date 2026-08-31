@@ -39,7 +39,7 @@ def test_concurrent_daemons_fail_closed_on_lock_and_cleanup(tmp_path, monkeypatc
 
 def test_daemon_never_stops_on_its_own_no_matter_how_long_it_waits() -> None:
     """No idle TTL, no maximum lifetime (KπX directive): `_await_explicit_stop()` must never
-    resolve on its own — only an explicit `admin stop`/`shutdown` RPC setting `_stop` can end it.
+    resolve on its own — only an explicit `admin service stop`/`shutdown` RPC setting `_stop` can end it.
     Regression guard for the exact bug that killed the whole daemon (CDP included) after an idle
     TTL resumed the instant the extension bridge merely dropped for an unrelated reason."""
 

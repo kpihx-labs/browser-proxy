@@ -60,7 +60,7 @@ people-profile concept (`Default`, `Profile 1`, … at `chrome://settings/people
 one `--user-data-dir`); never confuse the two. `materialize_edge_profile()` only ever `mkdir`s the
 directory — it **declares** it, it does not make Edge treat it as real. `paths.edge_profile_state()`
 is the one predicate (`not_declared`/`declared`/`initialized`, keyed on Edge's own `Local State`
-marker file) used identically by `profile-list`, `admin edge status`, `admin status`, and direct-CDP
+marker file) used identically by `profile-list`, `admin profile status`, `admin status`, and direct-CDP
 action resolution — see `CONTRACT.md` → Profile lifecycle management. `profile_state.py` is the
 single canonical module computing disk state + systemd activation + real CDP reachability (no
 longer hand-duplicated between `daemon.py` and `cli.py`); `materialize_edge_profile()` refuses
@@ -115,10 +115,10 @@ extension approval; a payload flag can never bypass it.
 
 ## Lifecycle
 
-The daemon (`browser-proxy.service`, started via `admin start`, or on demand by the client's own
+The daemon (`browser-proxy.service`, started via `admin service start`, or on demand by the client's own
 fallback) owns an exclusive lock and uses a Unix-domain socket. **It has deliberately NO automatic
-timeout — no idle TTL, no maximum lifetime (KπX directive).** It is purely lançable/arrêtable on
-request: `admin start`/`admin stop` (which now sends the real `shutdown` RPC over the socket first,
+timeout — no idle TTL, no maximum lifetime (KπX directive).** It is purely launchable/stoppable on
+request: `admin service start`/`admin service stop` (which now sends the real `shutdown` RPC over the socket first,
 falling back to `systemctl stop` only if the socket is unreachable), or the OS itself. Every
 managed Edge window is already always visible, so KπX can directly see and close one an agent
 forgot — there is no case where an unattended timeout is the right way to reclaim a daemon.
@@ -128,13 +128,40 @@ daemon's lifetime — never a raw `subprocess.Popen`, never a hand-typed `micros
 **There is no headless mode and no flag to hide the window: every instance is always real and
 visible, by design (100% Transparency).**
 
+### admin commands
+
 ```bash
-browser-proxy admin edge install                  # once per machine: link the unit template
-browser-proxy admin edge start test               # real window opens
+# --- Service (daemon) ---
+browser-proxy admin service install               # once per machine: link + enable the daemon unit
+browser-proxy admin service start                  # start the daemon, verify with ping
+browser-proxy admin service stop                   # graceful shutdown (RPC first, then systemctl)
+browser-proxy admin service restart                # stop + start + verify
+browser-proxy admin service logs                   # last 50 lines of daemon journal
+browser-proxy admin service purge                  # stop + disable + unlink daemon service
+
+# --- Profile (Edge instances) ---
+browser-proxy admin profile install                # once per machine: link the profile unit template
+browser-proxy admin profile start test             # real window opens
+browser-proxy admin profile stop test              # stop one Edge instance
+browser-proxy admin profile restart test           # restart one Edge instance
+browser-proxy admin profile status test            # state / systemd_active / cdp_port / cdp_reachable / extension_connected
+browser-proxy admin profile logs test              # last 50 lines of Edge profile journal
+browser-proxy admin profile purge test             # stop + trash profile directory
+
+# --- Extension ---
+browser-proxy admin extension pair                 # store the pairing secret (hidden prompt)
+browser-proxy admin extension unpair               # remove the stored pairing token
+browser-proxy admin extension status               # token health: existence, permissions, masked preview
+
+# --- Global ---
+browser-proxy admin status                         # all services + files + symlinks + token + permissions
+browser-proxy admin doctor                         # diagnose + fix missing dirs, symlinks, permissions
+browser-proxy admin purge                          # full purge (all profiles, daemon, state) + uv tool hint
+
+# --- Workflow ---
 #   -> edge://extensions -> developer mode -> load unpacked -> browser-proxy-ext/
 #   -> browser-proxy admin extension pair -> paste secret in the extension's options page
 browser-proxy do profile-start '{"profile":"test"}'   # daemon starts the same unit if not already running
-browser-proxy admin edge status test              # state / systemd_active / cdp_port / cdp_reachable / extension_connected
 browser-proxy do profile-remove '{"profile":"test"}'  # stops the unit if active, trashes the directory (never a permanent delete)
 ```
 
@@ -163,9 +190,9 @@ scattered across `paths.py`/`daemon.py`/`bridge.py`/`cli.py`.
 
 `browser-proxy-ext` is an independent repository and Git submodule. Build it with its own Makefile; its compiled package is submitted only to Microsoft Edge Add-ons.
 
-`browser-proxy admin extension pair` rotates a mode-0600 local capability without displaying it, stored under `paths.persistent_state_dir()` (survives reboot/logout — never the daemon's ephemeral `runtime_dir()`/tmpfs). The extension bridge only accepts an authenticated typed `handshake` and dispatches typed request/reply frames over loopback. The extension's own reconnect loop is backed by a `chrome.alarms` watchdog (not just `setTimeout`), so it recovers even after a Manifest V3 service-worker eviction.
+`browser-proxy admin extension pair` rotates a mode-0600 local capability without displaying it, stored under `paths.persistent_state_dir()` (survives reboot/logout — never the daemon's ephemeral `runtime_dir()`/tmpfs). `admin extension status` shows the token health (existence, permissions, masked preview). `admin extension unpair` removes the token file. The extension bridge only accepts an authenticated typed `handshake` and dispatches typed request/reply frames over loopback. The extension's own reconnect loop is backed by a `chrome.alarms` watchdog (not just `setTimeout`), so it recovers even after a Manifest V3 service-worker eviction.
 
-**One Options-page setup per profile, not just once per machine:** each profile is a separate Edge install with its own extension storage — its Options page (`browser-proxy-ext/options.html`) needs both the shared secret AND a **Browser-proxy profile** field matching the exact profile name used with `admin edge start`/`profile-start` for that window. The shared secret can be the same value across every profile; the declared profile name must be unique per install, or requests will be routed to whichever install most recently declared that name.
+**One Options-page setup per profile, not just once per machine:** each profile is a separate Edge install with its own extension storage — its Options page (`browser-proxy-ext/options.html`) needs both the shared secret AND a **Browser-proxy profile** field matching the exact profile name used with `admin profile start`/`profile-start` for that window. The shared secret can be the same value across every profile; the declared profile name must be unique per install, or requests will be routed to whichever install most recently declared that name.
 
 ## Security
 
