@@ -34,9 +34,9 @@
 
 ## Structure
 
-- `src/browser_proxy/`: Python daemon, JSON-RPC CLI, action registry, direct CDP adapter, and deterministic Edge profile path/port resolution (`paths.py`).
+- `src/browser_proxy/`: Python daemon, JSON-RPC CLI, action registry, direct CDP adapter, deterministic Edge profile path/port resolution (`paths.py`), and **package-data** `services/` — the single source of truth for every managed unit: `browser-proxy.service` (the daemon itself) and the single templated Edge unit, `browser-proxy-profile@.service` (one instance per profile, always visible). Package-relative (`Path(__file__).parent / "services"` + `importlib.resources` when needed) so it works both `--editable` and wheel/`.venv` installs — never `parents[2]/services`. The templated Edge unit intentionally omits `NoNewPrivileges` (unlike the daemon's own unit) so the SUID `chrome-sandbox` helper keeps working without `--no-sandbox`.
 - `browser-proxy-ext/`: independent TypeScript extension repository, tracked here as a git submodule.
-- `services/`: source of truth for every managed unit — `browser-proxy.service` (the daemon itself) and the single templated Edge unit, `browser-proxy-profile@.service` (one instance per profile, always visible). It intentionally omits `NoNewPrivileges` (unlike the daemon's own unit) so the SUID `chrome-sandbox` helper keeps working without `--no-sandbox`.
+- `services/` (repo root, deprecated): kept as thin re-export for one release for backward compat, then purged — canonical location is now `src/browser_proxy/services/` inside the package.
 
 ## Verification
 

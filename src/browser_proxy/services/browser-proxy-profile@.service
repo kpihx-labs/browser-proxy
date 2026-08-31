@@ -1,0 +1,12 @@
+[Unit]
+Description=Managed Microsoft Edge CDP instance for browser-proxy profile %i (always a real, visible window — 100% Transparency, no headless mode)
+After=graphical-session.target
+Wants=graphical-session.target
+
+# No NoNewPrivileges here (unlike browser-proxy.service): Edge's SUID chrome-sandbox
+# helper needs setuid execution to sandbox renderer processes without --no-sandbox.
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/browser-proxy edge-launch %i
+Restart=on-failure
+RestartSec=2

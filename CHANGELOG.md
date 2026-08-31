@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.0 - 2026-08-31
+
+- **`page-screenshot` — removed the `translateZ(0)` body-transform hack** (root cause of SPA
+  layout breakage on YouTube Music and other complex SPAs). The old hack modified
+  `document.body.style.transform` to force a repaint before capturing, but this changed the
+  page's computed style, triggering layout recalculations that broke rendering (player bar
+  disappeared, queue became invisible, page went black). `Page.captureScreenshot` already forces
+  an internal repaint — the hack was unnecessary. Now optional via `force_repaint: true` payload
+  param, to be used only as a last resort.
+- **New action: `page-press`** — press and release a keyboard key via CDP `Input.dispatchKeyEvent`
+  (`keyDown` + `keyUp`). This is the real CDP input pipeline, unlike `page-evaluate` + JS
+  `new KeyboardEvent().dispatchEvent()` which only fires in the JS event system and may be
+  ignored by the page's internal handlers. Accepts `key` (e.g. `"Space"`, `"Enter"`,
+  `"ArrowDown"`), optional `text` (character to insert), optional `modifier` bitfield
+  (1=Alt, 2=Ctrl, 4=Meta, 8=Shift). Ideal for play/pause, navigation, and keyboard shortcuts
+  on complex SPAs.
+
 ## 0.6.0 - 2026-08-30
 
 - **3 live-verified bugs found and fixed during a full real-site test sweep of all 7 HITL actions

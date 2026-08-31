@@ -69,8 +69,9 @@ def test_all_new_page_actions_are_registered() -> None:
     # pair — live-verified `getItem`/`setItem` had no `removeItem`/`clear` counterpart) = 66;
     # +1 (page-click-eval: atomic Runtime.evaluate-based bounding box resolution, eliminates
     # the race condition that affects page-click on dynamic pages) = 67;
-    # +1 (page-click-eval counted in REGISTRY) = 68 → 69 with page-click-eval = 69.
-    assert len(REGISTRY) == 69
+    # +1 (page-click-eval counted in REGISTRY) = 68;
+    # +1 (page-press: CDP Input.dispatchKeyEvent for proper keyboard input) = 69 → 70.
+    assert len(REGISTRY) == 70
     assert "group-sync" not in REGISTRY
 
 

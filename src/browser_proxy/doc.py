@@ -103,6 +103,7 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "click_count": 2,
     },
     "page-hover": {"profile": "default", "target_id": "<target-id>", "selector": "#menu"},
+    "page-press": {"profile": "default", "target_id": "<target-id>", "key": "Space"},
     "page-type": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -519,6 +520,12 @@ EXAMPLE_RESULTS: dict[str, dict[str, Any]] = {
         "selector": "#menu",
         "hovered": True,
     },
+    "page-press": {
+        "profile": "default",
+        "target_id": "<target-id>",
+        "key": "Space",
+        "pressed": True,
+    },
     "page-type": {
         "profile": "default",
         "target_id": "<target-id>",
@@ -670,9 +677,10 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "page-reload": ("ignore_cache", "wait_seconds"),
     "page-type": ("clear",),
     "page-click-coordinates": ("button", "click_count"),
+    "page-press": ("modifier", "text"),
     "page-scroll": ("selector", "x", "y"),
     "page-evaluate": ("await_promise",),
-    "page-screenshot": ("format", "output"),
+    "page-screenshot": ("format", "output", "force_repaint"),
     "page-console-list": ("clear",),
     "page-dialog-policy": ("prompt_text",),
     "cookie-set": ("path", "secure", "http_only"),

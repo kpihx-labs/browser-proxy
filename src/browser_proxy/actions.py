@@ -2415,6 +2415,111 @@ async def _page_hover(payload: dict[str, Any], context: DaemonContext) -> dict[s
     }
 
 
+async def _page_press(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
+    """Purpose: press and release a keyboard key on an Edge page via CDP Input domain.
+
+    Args:
+        payload (dict[str, Any]): Profile, required ``target_id``, required ``key`` (e.g.
+            ``"Space"``, ``"Enter"``, ``"ArrowDown"``, ``"a"``), optional ``text`` (character
+            to insert on keyDown), optional ``modifier`` (bitfield: 1=Alt, 2=Ctrl/Cmd,
+            4=Meta/Cmd, 8=Shift).
+        context (DaemonContext): Daemon state used to resolve the Edge profile.
+
+    Returns:
+        dict[str, Any]: Profile, target ID, key pressed, and a confirmed flag.
+
+    Notes:
+        Uses ``Input.dispatchKeyEvent`` (``keyDown`` + ``keyUp``), which is the real CDP
+        input pipeline — unlike ``page-evaluate`` + ``new KeyboardEvent().dispatchEvent()``
+        which only fires in the JS event system and may be ignored by the page's internal
+        handlers. This is the correct primitive for play/pause (``Space``), navigation
+        (``ArrowDown``/``ArrowUp``/``Enter``), and any keyboard shortcut on complex SPAs
+        like YouTube Music.
+
+    Examples:
+        >>> _page_press.__name__
+        '_page_press'
+        >>> callable(_page_press)
+        True
+    """
+    name, browser = _profile(payload, context)
+    target_id = str(payload.get("target_id", ""))
+    key = str(payload.get("key", ""))
+    if not target_id or not key:
+        raise ValueError("target_id and key are required")
+
+    # Key-to-virtual-keycode map for common keys
+    _KEY_CODES: dict[str, int] = {
+        "Space": 32,
+        "Enter": 13,
+        "Tab": 9,
+        "Escape": 27,
+        "Backspace": 8,
+        "Delete": 46,
+        "ArrowDown": 40,
+        "ArrowUp": 38,
+        "ArrowLeft": 37,
+        "ArrowRight": 39,
+        "Home": 36,
+        "End": 35,
+        "PageUp": 33,
+        "PageDown": 34,
+        "F1": 112,
+        "F2": 113,
+        "F3": 114,
+        "F4": 115,
+        "F5": 116,
+        "F6": 117,
+        "F7": 118,
+        "F8": 119,
+        "F9": 120,
+        "F10": 121,
+        "F11": 122,
+        "F12": 123,
+    }
+    modifier = int(payload.get("modifier", 0))
+    text = payload.get("text", "")
+
+    key_code = _KEY_CODES.get(key, 0)
+    # For single printable characters, derive the keycode from the character
+    if not key_code and len(key) == 1:
+        key_code = ord(key.upper())
+
+    key_down: dict[str, Any] = {
+        "type": "keyDown",
+        "key": key,
+        "code": key,
+        "windowsVirtualKeyCode": key_code,
+        "nativeVirtualKeyCode": key_code,
+    }
+    key_up: dict[str, Any] = {
+        "type": "keyUp",
+        "key": key,
+        "code": key,
+        "windowsVirtualKeyCode": key_code,
+        "nativeVirtualKeyCode": key_code,
+    }
+    if modifier:
+        key_down["modifiers"] = modifier
+        key_up["modifiers"] = modifier
+    if text:
+        key_down["text"] = text
+
+    await browser.page_session(
+        target_id,
+        [
+            ("Input.dispatchKeyEvent", key_down),
+            ("Input.dispatchKeyEvent", key_up),
+        ],
+    )
+    return {
+        "profile": name,
+        "target_id": target_id,
+        "key": key,
+        "pressed": True,
+    }
+
+
 async def _page_type(payload: dict[str, Any], context: DaemonContext) -> dict[str, Any]:
     """Purpose: focus an Edge page element and type text into it, optionally clearing first.
 
@@ -2673,11 +2778,21 @@ async def _page_screenshot(payload: dict[str, Any], context: DaemonContext) -> d
     """Purpose: capture an Edge page screenshot, optionally saved to a local file path.
 
     Args:
-        payload (dict[str, Any]): Profile, ``target_id``, optional ``format``, optional ``output``.
+        payload (dict[str, Any]): Profile, ``target_id``, optional ``format``, optional ``output``,
+            optional ``force_repaint`` (default False — applying a CSS transform to force
+            repaint can break complex SPAs like YouTube Music by modifying computed styles).
         context (DaemonContext): Daemon state used to resolve the Edge profile.
 
     Returns:
         dict[str, Any]: Profile, target ID, and either a saved ``path`` or base64 ``data``.
+
+    Notes:
+        ``Page.captureScreenshot`` already forces an internal repaint. The old
+        ``translateZ(0)`` body-transform hack was removed because it modifies the
+        page's computed style and breaks SPAs that depend on stable CSS state
+        (e.g. YouTube Music — the player bar disappears and the layout shatters).
+        Pass ``force_repaint: true`` only as a last resort on pages that genuinely
+        need a style nudge.
 
     Examples:
         >>> _page_screenshot.__name__
@@ -2691,16 +2806,15 @@ async def _page_screenshot(payload: dict[str, Any], context: DaemonContext) -> d
         raise ValueError("target_id is required")
     image_format = str(payload.get("format", "png"))
 
-    repaint_expr = "document.body.style.transform = 'translateZ(0)';"
+    calls: list[tuple[str, Any]] = []
+    if payload.get("force_repaint"):
+        calls.append(
+            ("Runtime.evaluate", {"expression": "document.body.style.transform = 'translateZ(0)';"})
+        )
+    calls.append(("Page.captureScreenshot", {"format": image_format}))
 
-    result = await browser.page_session(
-        target_id,
-        [
-            ("Runtime.evaluate", {"expression": repaint_expr}),
-            ("Page.captureScreenshot", {"format": image_format}),
-        ],
-    )
-    data = str(result[1].get("data", ""))
+    result = await browser.page_session(target_id, calls)
+    data = str(result[-1].get("data", ""))
 
     output = payload.get("output")
     if not output and not payload.get("base64"):
@@ -3671,6 +3785,7 @@ REGISTRY = {
         _action("page-click-eval", "Interaction", _page_click_eval),
         _action("page-click-coordinates", "Interaction", _page_click_coordinates),
         _action("page-hover", "Interaction", _page_hover),
+        _action("page-press", "Interaction", _page_press),
         _action("page-type", "Interaction", _page_type),
         _action("page-fill-form", "Interaction", _page_fill_form),
         _action("page-select-option", "Interaction", _page_select_option),

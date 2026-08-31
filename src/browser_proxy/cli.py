@@ -36,6 +36,45 @@ from browser_proxy.paths import (
 )
 from browser_proxy.profile_state import describe_edge_profile, profile_unit_name
 
+
+def _services_dir() -> Path:
+    """Purpose: package-relative directory holding systemd unit templates.
+
+    Args:
+        None: No arguments — directory is derived from this file's location.
+
+    Returns:
+        Path to ``src/browser_proxy/services`` — works in editable and wheel installs.
+
+    Examples:
+        >>> _services_dir().name
+        'services'
+        >>> _services_dir().is_dir()
+        True
+    """
+
+    return Path(__file__).parent / "services"
+
+
+def _service_file(name: str) -> Path:
+    """Purpose: resolve one unit template inside the package.
+
+    Args:
+        name (str): File name, e.g. ``browser-proxy.service``.
+
+    Returns:
+        Absolute path to the unit template.
+
+    Examples:
+        >>> _service_file("browser-proxy.service").name
+        'browser-proxy.service'
+        >>> _service_file("browser-proxy-profile@.service").suffix
+        '.service'
+    """
+
+    return _services_dir() / name
+
+
 app = typer.Typer(
     name="browser-proxy", help="Unified Microsoft Edge JSON-RPC proxy.", no_args_is_help=True
 )
@@ -381,7 +420,6 @@ def admin_status() -> None:
         True
     """
 
-    project = Path(__file__).resolve().parents[2]
     data: dict[str, Any] = {}
 
     # Daemon RPC status
@@ -392,8 +430,8 @@ def admin_status() -> None:
     }
 
     # Service file symlinks
-    service_src = project / "services/browser-proxy.service"
-    profile_src = project / "services/browser-proxy-profile@.service"
+    service_src = _service_file("browser-proxy.service")
+    profile_src = _service_file("browser-proxy-profile@.service")
     xdg_config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
     service_link = xdg_config / "systemd/user/browser-proxy.service"
     profile_link = xdg_config / "systemd/user/browser-proxy-profile@.service"
@@ -466,10 +504,10 @@ admin_app.add_typer(service_app, name="service")
 
 @service_app.command("install")
 def admin_service_install() -> None:
-    """Purpose: link and enable the repository-owned singleton daemon service.
+    """Purpose: link and enable the package-owned singleton daemon service.
 
     Args:
-        None: Uses the repository-relative daemon service unit file.
+        None: Uses the package-relative daemon service unit file.
 
     Returns:
         None: Emits one stable systemd result envelope.
@@ -480,8 +518,7 @@ def admin_service_install() -> None:
         >>> admin_service_install.__name__
         'admin_service_install'
     """
-    project = Path(__file__).resolve().parents[2]
-    service = project / "services/browser-proxy.service"
+    service = _service_file("browser-proxy.service")
     result = _systemctl("link", str(service))
     if result.meta.status == "ok":
         result = _systemctl("enable", "browser-proxy.service")
@@ -646,7 +683,7 @@ def admin_profile_install() -> None:
     """Purpose: link the Edge profile unit template once, before any profile is started.
 
     Args:
-        None: Uses the single repository-relative templated unit file, linked
+        None: Uses the single package-relative templated unit file, linked
             once, not per profile instance.
 
     Returns:
@@ -658,8 +695,7 @@ def admin_profile_install() -> None:
         >>> admin_profile_install.__name__
         'admin_profile_install'
     """
-    project = Path(__file__).resolve().parents[2]
-    _emit(_systemctl("link", str(project / "services/browser-proxy-profile@.service")), None)
+    _emit(_systemctl("link", str(_service_file("browser-proxy-profile@.service"))), None)
 
 
 @profile_app.command("start")
@@ -971,7 +1007,6 @@ def admin_doctor() -> None:
         >>> admin_doctor.__name__
         'admin_doctor'
     """
-    project = Path(__file__).resolve().parents[2]
     fixes: list[str] = []
     checks: list[str] = []
 
@@ -999,8 +1034,8 @@ def admin_doctor() -> None:
         fixes.append(f"created systemd user dir: {systemd_user_dir}")
 
     service_pairs = [
-        ("browser-proxy.service", project / "services/browser-proxy.service"),
-        ("browser-proxy-profile@.service", project / "services/browser-proxy-profile@.service"),
+        ("browser-proxy.service", _service_file("browser-proxy.service")),
+        ("browser-proxy-profile@.service", _service_file("browser-proxy-profile@.service")),
     ]
     for unit_name, src in service_pairs:
         link = systemd_user_dir / unit_name
