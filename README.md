@@ -19,6 +19,7 @@ business data. This applies to every action, including `raw`.
 browser-proxy do profile-list '{}'
 browser-proxy do profile-remove '{"profile":"test"}'
 browser-proxy do window-create '{"profile":"default","url":"https://example.com"}'
+browser-proxy do window-create '{"profile":"default","incognito":true,"layout":[{"type":"tab","url":"https://example.com"}]}'
 browser-proxy do window-create '{"profile":"default","url":"https://a.example","items":[
   {"type":"tab","url":"https://b.example"},
   {"type":"group","title":"Research","tabs":["https://c.example","https://d.example"]},
@@ -29,6 +30,7 @@ browser-proxy do group-list '{"profile":"default"}'
 browser-proxy do tab-move '{"profile":"default","tab_id":12,"after_tab_id":34}'
 browser-proxy do group-add-tabs '{"profile":"default","group_id":7,"tab_ids":[12,13]}'
 browser-proxy do group-remove-tabs '{"profile":"default","tab_ids":[12]}'
+browser-proxy do tab-create '{"profile":"default","url":"https://example.com","incognito":true}'  # incognito creates in a fresh InPrivate context
 browser-proxy do window-sync '{"profile":"default","window_id":143985332,"layout":[
   {"type":"tab","tab_id":1},
   {"type":"group","title":"Research","tab_ids":[2,3]},

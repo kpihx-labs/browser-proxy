@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.7.0 - 2026-08-31
+## 0.8.0 - 2026-08-31
+
+- **InPrivate/Incognito navigation** — `window-create` and `tab-create` both accept a new
+  optional `incognito: bool` parameter. When `true`, the tab(s) are created in a fresh
+  `Target.createBrowserContext` private browsing context instead of the profile's default context.
+  All layout tabs in `window-create` share the same incognito context; `tab-create` creates its
+  own per-call context. `incognito` is mutually exclusive with `window_id` in `tab-create` (you
+  cannot add an incognito tab to a non-incognito window). Uses `Target.createBrowserContext`
+  (the correct CDP domain for Edge — `Browser.createBrowserContext` does not exist in Edge CDP).
+
+## 0.7.0 (previous) - 2026-08-31
 
 - **`page-screenshot` — removed the `translateZ(0)` body-transform hack** (root cause of SPA
   layout breakage on YouTube Music and other complex SPAs). The old hack modified

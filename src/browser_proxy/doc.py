@@ -21,6 +21,11 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "profile": "default",
         "layout": [{"type": "tab", "url": "https://example.com"}],
     },
+    "window-create-incognito": {
+        "profile": "default",
+        "incognito": True,
+        "layout": [{"type": "tab", "url": "https://httpbin.org/ip"}],
+    },
     "window-close": {"profile": "default", "target_ids": ["<target-id>"]},
     "window-sync": {
         "profile": "default",
@@ -42,6 +47,11 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "url": "https://example.com",
         "window_id": 143985019,
         "group_id": 1,
+    },
+    "tab-create-incognito": {
+        "profile": "default",
+        "incognito": True,
+        "url": "https://httpbin.org/ip",
     },
     "tab-activate": {"profile": "default", "target_id": "<target-id>"},
     "tab-update": {
@@ -649,6 +659,11 @@ FIELD_NOTES: dict[str, str] = {
         '{"type":"group","group_id":N (optional),"title":str,"color":str,"tab_ids":[N,...]}.'
     ),
     "new_window": "Whether to open a genuinely new Edge window instead of the current one.",
+    "incognito": (
+        "Whether to create the window/tab in a disposable InPrivate browser context "
+        "(via ``Browser.createBrowserContext`` with ``disposeOnDetach: true``). "
+        "Mutually exclusive with ``window_id``."
+    ),
     "bounds": 'Window bounds, any subset of {"left","top","width","height"} (real pixels).',
     "state": '`"normal"`, `"maximized"`, `"minimized"`, `"fullscreen"`, or `"locked-fullscreen"`.',
     "focused": "Whether the window should be given input focus.",
@@ -685,6 +700,7 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "page-dialog-policy": ("prompt_text",),
     "cookie-set": ("path", "secure", "http_only"),
     "storage-local-get": ("key",),
+    "window-create": ("incognito",),
     "tab-create": (
         "new_window",
         "window_id",
@@ -693,6 +709,7 @@ OPTIONAL_FIELDS: dict[str, tuple[str, ...]] = {
         "before_tab_id",
         "after_tab_id",
         "wait_seconds",
+        "incognito",
     ),
     "tab-update": ("url", "window_id", "group_id", "index", "before_tab_id", "after_tab_id"),
     "window-sync": ("bounds", "state", "focused", "layout"),
@@ -725,7 +742,11 @@ ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
     (
         "tab-create",
         "window_id",
-    ): "Open directly in this EXISTING window instead of a new one — mutually exclusive with `new_window`.",
+    ): "Open directly in this EXISTING window instead of a new one — mutually exclusive with `new_window` and `incognito`.",
+    (
+        "tab-create",
+        "incognito",
+    ): "Create the tab in a disposable InPrivate browser context (via `Browser.createBrowserContext`). Mutually exclusive with `window_id`.",
     (
         "tab-create",
         "group_id",
@@ -742,6 +763,10 @@ ACTION_FIELD_NOTES: dict[tuple[str, str], str] = {
         "group-remove-tabs",
         "tab_ids",
     ): "Real numeric Edge tab IDs to remove from their group (never closed).",
+    (
+        "window-create",
+        "incognito",
+    ): "Create the whole window in a disposable InPrivate browser context (via `Browser.createBrowserContext`). All tabs in the layout land in the same InPrivate context.",
     (
         "page-dialog-policy",
         "action",

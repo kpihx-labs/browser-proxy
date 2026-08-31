@@ -2,6 +2,10 @@
 
 ## Next
 
+- ~~Live-verify `incognito: true` on `window-create` and `tab-create`~~ — done (2026-08-31): both
+  create tabs with a different `browserContextId` from the profile default, confirmed via `window-list`
+  and `tab-get`. Extension disconnects prevent `window-close` cleanup via `@require_approval` — use
+  `raw` + `Target.closeTarget` as fallback when the extension is unavailable.
 - Complete the extension's store artwork, privacy declaration, and manual submission metadata.
 - Validate the disk-backed persistent profile inventory and the separate heuristic Workspace view
   against real daily-use Edge profiles; Edge exposes no authoritative Workspace API.

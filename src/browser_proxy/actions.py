@@ -526,6 +526,8 @@ async def _create_window_tab(
     capture_chrome_id: bool,
     *,
     new_window: bool = False,
+    incognito: bool = False,
+    browser_context_id: str | None = None,
 ) -> tuple[str, int | None]:
     """Purpose: create ONE tab — inside an existing window, in a genuinely new one, or the current
     one — optionally capturing its REAL chrome tab id. The single, centralized tab-creation
@@ -545,6 +547,13 @@ async def _create_window_tab(
             string).
         new_window (bool): Force a genuinely new Edge window instead of the current one; ignored
             (never sent) when ``window_id`` is given.
+        incognito (bool): Create the tab in a disposable InPrivate browser context instead of the
+            profile's default context.  Uses ``Target.createBrowserContext`` with
+            ``private: true`` so the context is created as incognito.  Mutually exclusive with
+            ``window_id`` — caller validates before calling.
+        browser_context_id (str | None): Pre-existing browser context ID to create the tab in.
+            When provided, ``incognito`` is ignored (the caller already created the context).
+            Used by ``_window_create`` to place all layout tabs in the same incognito context.
 
     Returns:
         tuple[str, int | None]: CDP ``target_id`` and, when requested, the real chrome tab id
@@ -559,6 +568,19 @@ async def _create_window_tab(
     options: dict[str, Any] = {"url": url}
     if window_id is not None:
         options["windowId"] = window_id
+    elif browser_context_id is not None:
+        options["browserContextId"] = browser_context_id
+    elif incognito:
+        ctx = await browser.call(
+            "Target.createBrowserContext",
+            {"private": True},
+        )
+        context_id = ctx.get("browserContextId")
+        if not isinstance(context_id, str):
+            raise RuntimeError(
+                "CDP_ERROR: Target.createBrowserContext returned no browserContextId"
+            )
+        options["browserContextId"] = context_id
     elif new_window:
         options["newWindow"] = True
     if not capture_chrome_id:
@@ -576,7 +598,14 @@ async def _create_window_tab(
 
 
 async def _apply_window_layout(
-    layout: Any, browser: CdpBrowser, context: DaemonContext, profile: str, window_id: int | None
+    layout: Any,
+    browser: CdpBrowser,
+    context: DaemonContext,
+    profile: str,
+    window_id: int | None,
+    *,
+    incognito: bool = False,
+    browser_context_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Purpose: create a whole ordered tab/group layout inside one window from a flat JSON list.
 
@@ -589,6 +618,11 @@ async def _apply_window_layout(
         context (DaemonContext): Daemon state exposing the paired extension (needed for groups).
         profile (str): Target browser-proxy profile.
         window_id (int | None): Real Edge window every created tab/group must land in.
+        incognito (bool): When True, every tab is created in a disposable InPrivate context
+            (forwarded to ``_create_window_tab``).
+        browser_context_id (str | None): Pre-existing browser context ID. When provided, all tabs
+            are created in this context (used by ``_window_create`` to keep all layout tabs in the
+            same incognito context).
 
     Returns:
         list[dict[str, Any]]: One entry per item in the exact order given. Each entry is
@@ -614,7 +648,14 @@ async def _apply_window_layout(
         if kind == "tab":
             url = str(item.get("url", "about:blank"))
             target_id, _ = await _create_window_tab(
-                browser, context, profile, window_id, url, capture_chrome_id=False
+                browser,
+                context,
+                profile,
+                window_id,
+                url,
+                capture_chrome_id=False,
+                incognito=incognito,
+                browser_context_id=browser_context_id,
             )
             created.append({"type": "tab", "url": url, "target_id": target_id})
         elif kind == "group":
@@ -635,7 +676,14 @@ async def _apply_window_layout(
                         f"layout[{index}].tabs[{tab_index}] must be a URL or {{'url': ...}}"
                     )
                 target_id, chrome_tab_id = await _create_window_tab(
-                    browser, context, profile, window_id, tab_url, capture_chrome_id=True
+                    browser,
+                    context,
+                    profile,
+                    window_id,
+                    tab_url,
+                    capture_chrome_id=True,
+                    incognito=incognito,
+                    browser_context_id=browser_context_id,
                 )
                 if chrome_tab_id is None:
                     raise RuntimeError(
@@ -706,15 +754,38 @@ async def _window_create(payload: dict[str, Any], context: DaemonContext) -> dic
         True
     """
     name, browser = _profile(payload, context)
+    incognito = bool(payload.get("incognito", False))
+    browser_context_id: str | None = None
     options: dict[str, Any] = {"url": "about:blank", "newWindow": True}
+    if incognito:
+        ctx = await browser.call(
+            "Target.createBrowserContext",
+            {"private": True},
+        )
+        context_id = ctx.get("browserContextId")
+        if not isinstance(context_id, str):
+            raise RuntimeError(
+                "CDP_ERROR: Target.createBrowserContext returned no browserContextId"
+            )
+        options["browserContextId"] = context_id
+        browser_context_id = context_id
     for key in ("left", "top", "width", "height", "windowState", "focus"):
         if key in payload:
             options[key] = payload[key]
     result = await browser.call("Target.createTarget", options)
     placeholder_target_id = result["targetId"]
     window_id, _bounds = await _window_id_for_target(browser, placeholder_target_id)
+    # When incognito, do NOT pass window_id to _apply_window_layout — Target.createTarget with
+    # windowId creates tabs in the default context, not the incognito context of that window.
+    # Instead, pass only browser_context_id so all layout tabs are created directly in the
+    # incognito context (Edge places them in the same window automatically).
     layout_result = await _apply_window_layout(
-        payload.get("layout"), browser, context, name, window_id
+        payload.get("layout"),
+        browser,
+        context,
+        name,
+        None if incognito else window_id,
+        browser_context_id=browser_context_id,
     )
     await browser.call("Target.closeTarget", {"targetId": placeholder_target_id})
     return {"profile": name, "window_id": window_id, "layout": layout_result}
@@ -1236,7 +1307,9 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
     Args:
         payload (dict[str, Any]): Profile, ``url``, optional ``new_window`` (bool — a genuinely new
             window instead of the current one), optional ``window_id`` (open directly in that
-            EXISTING window instead — mutually exclusive with ``new_window``), optional ``group_id``
+            EXISTING window instead — mutually exclusive with ``new_window`` and ``incognito``),
+            optional ``incognito`` (bool — create in a disposable InPrivate context instead of the
+            profile's default; mutually exclusive with ``window_id``), optional ``group_id``
             (add the new tab into that EXISTING group/folder the instant it is created), optional
             ``wait_seconds`` (defaults to `10`, same convention as ``page-navigate``/``page-reload``
             — how long to wait for the newly created tab's OWN initial load to reach
@@ -1255,7 +1328,9 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
         ``window_id``/``group_id``/``index`` after that placement.
 
     Raises:
-        ValueError: Both ``new_window`` and ``window_id`` given (ambiguous intent).
+        ValueError: Both ``new_window`` and ``window_id`` given (ambiguous intent), or
+            ``incognito`` combined with ``window_id`` (cannot add an incognito tab to an
+            existing normal window).
 
     Notes:
         Deliberately NOT ``@require_approval`` (KπX directive, same rationale as
@@ -1270,10 +1345,16 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
     """
     name, browser = _profile(payload, context)
     url = str(payload.get("url", "about:blank"))
+    incognito = bool(payload.get("incognito", False))
     new_window = bool(payload.get("new_window", False))
     raw_window_id = payload.get("window_id")
     if new_window and raw_window_id is not None:
         raise ValueError("new_window and window_id are mutually exclusive")
+    if incognito and raw_window_id is not None:
+        raise ValueError(
+            "incognito and window_id are mutually exclusive "
+            "(cannot add an incognito tab to an existing normal window)"
+        )
     group_id = payload.get("group_id")
     position_fields = ("index", "before_tab_id", "after_tab_id")
     wants_position = any(payload.get(field) is not None for field in position_fields)
@@ -1288,6 +1369,7 @@ async def _tab_create(payload: dict[str, Any], context: DaemonContext) -> dict[s
         url,
         capture_chrome_id=needs_chrome_id,
         new_window=new_window,
+        incognito=incognito,
     )
     ready_state = ""
     for _ in range(max(1, int(wait_seconds / 0.2))):
