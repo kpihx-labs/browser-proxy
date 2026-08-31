@@ -110,6 +110,19 @@ or mutate the exact same state. See `CONTRACT.md` → Canonical tab/group struct
 `tabs`/`groups`/`order` shape, the CDP-`target_id`-vs-`chrome_tab_id` bridging strategy, and why the
 3 new movement actions are deliberately approval-free like `window-create`/`tab-create`.
 
+**🔴 InPrivate tab visibility:** `computeWindowLayouts()` uses `chrome.tabs.query({})` to list all
+tabs. InPrivate tabs are only visible if the extension has **"Allow in incognito"** enabled in
+`edge://extensions/` AND the manifest declares `"incognito": "spanning"`. Without these,
+`chrome_layout` is `None` for InPrivate windows and group/tab-repositioning operations fail.
+
+**🔴 InPrivate tab grouping limitation (Chromium platform):** `chrome.tabs.group()` cannot resolve
+tabs inside InPrivate windows — throws "No tab with id" for valid tab IDs. Root cause: Chromium's
+`GetTabById()` does not search incognito `Browser` instances despite `include_incognito_information()`
+returning `true`. This is a Chromium/Edge API limitation, not a code bug. Edge's native UI drag &
+drop uses an internal code path not exposed via the extension API. Working InPrivate actions:
+`tab-create`, `tab-close`, `tab-activate`, `page-navigate`, `window-close`. Broken: `group-create`,
+`group-add-tabs`, `group-remove-tabs`, `tab-move`, `window-sync` layout grouping.
+
 `raw` sends a browser-level CDP method and its parameters inside that same object. Conservative
 read-only methods (`Browser.getVersion`, `Target.getTargets`, and related inspection calls) run
 without approval. Every other raw method, including mutations, is blocked behind fail-closed

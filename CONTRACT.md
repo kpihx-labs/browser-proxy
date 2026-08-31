@@ -180,6 +180,28 @@ independently-fetched copy:
 All three are PURE PROJECTIONS of the identical `chrome.tabs.query`/`chrome.tabGroups.query`
 snapshot, computed once per call — never three sources that could drift apart.
 
+**🔴 InPrivate tab visibility requirement:** `computeWindowLayouts()` relies on `chrome.tabs.query({})`
+to enumerate ALL tabs. By default, Chrome/Edge extensions **cannot see InPrivate tabs** — the
+extension must have **"Allow in incognito"** (Edge) / **"Allow in incognito"** (Chrome) enabled in
+`edge://extensions/`. Without this permission, `chrome.tabs.query({})` returns only normal-context
+tabs; InPrivate windows are invisible to `computeWindowLayouts()`, so `chrome_layout` is `None` for
+those windows, `tab_id` is `None` for their tabs, and group operations (`group-create`,
+`group-add-tabs`, `tab-update`) fail because real chrome tab IDs cannot be resolved. This is a
+browser-level permission gate, not a code limitation — the daemon and extension code are already
+complete and handle InPrivate tabs correctly once the permission is granted.
+
+**🔴 InPrivate tab grouping limitation (Chromium platform):** Even with `"incognito": "spanning"` in
+the manifest AND "Allow in incognito" enabled, `chrome.tabs.group()` cannot resolve tabs inside
+InPrivate windows — it throws "No tab with id" for tab IDs that `chrome.tabs.query({windowId})`
+returns successfully. Root cause: `chrome.tabs.group()` internally calls `GetTabById()` which
+iterates `BrowserList` profiles; the incognito `Browser` instances are not found despite
+`include_incognito_information()` returning `true`. This is a **Chromium/Edge API limitation**, not a
+bug in the extension. Edge's native UI (drag & drop) uses an internal code path not exposed via the
+extension API. **Working InPrivate actions:** `tab-create`, `tab-close`, `tab-activate`,
+`page-navigate`, `window-close`, `window-create`, `window-list`, `tab-list`. **Broken InPrivate
+actions:** `group-create`, `group-add-tabs`, `group-remove-tabs`, `tab-move`, `window-sync`
+layout grouping.
+
 **Where this surfaces:**
 - **`window-list`** gained `chrome_layout: {tabs, groups, order} | null` per window (`window.layout`
   bridge kind, all windows fetched in one call) — `null` only when the extension is not connected

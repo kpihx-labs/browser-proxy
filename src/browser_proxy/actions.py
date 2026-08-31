@@ -1291,6 +1291,7 @@ async def _tabs_with_context(
             entry = dict(tab)
             entry["window_id"] = window["window_id"]
             chrome_tab = chrome_by_target.get(tab["targetId"])
+            entry["tab_id"] = chrome_tab.get("chrome_tab_id") if chrome_tab else None
             group_id = chrome_tab.get("group_id") if chrome_tab else None
             entry["group_id"] = group_id
             entry["group_title"] = (
