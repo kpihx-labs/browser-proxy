@@ -3409,11 +3409,15 @@ async def _group_create(payload: dict[str, Any], context: DaemonContext) -> dict
     """Purpose: create an Edge tab group through the paired extension.
 
     Args:
-        payload (dict[str, Any]): Profile, ``tab_ids``, ``title``, and optional ``color``.
+        payload (dict[str, Any]): Profile, ``tab_ids``, ``window_id``, ``title``, and optional ``color``.
+        ``window_id`` is REQUIRED — the real Edge window where the group will be created.
         context (DaemonContext): Daemon state exposing the paired extension.
 
     Returns:
         dict[str, Any]: Extension-confirmed created tab-group information.
+
+    Raises:
+        ValueError: ``window_id`` is missing from the payload.
 
     Examples:
         >>> _group_create.__name__
@@ -3421,6 +3425,8 @@ async def _group_create(payload: dict[str, Any], context: DaemonContext) -> dict
         >>> callable(_group_create)
         True
     """
+    if "window_id" not in payload:
+        raise ValueError("group-create requires 'window_id' — the target window for the new group")
     return await _extension(payload, context, "group.create")
 
 

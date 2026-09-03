@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1 - 2026-09-03
+
+- **`group-create` requires `window_id`** — the `group-create` action now mandates a `window_id`
+  parameter specifying the real Edge window where the group will be created. This prevents
+  accidentally grouping tabs from the wrong window (e.g. Workspace vs InPrivate). The extension
+  passes `createProperties: { windowId }` to `chrome.tabs.group()` so Chromium targets the
+  correct window. Missing `window_id` raises a clear `ValueError` (Python daemon) or
+  `Error` (extension).
+
 ## 0.8.0 - 2026-08-31
 
 - **InPrivate/Incognito navigation** — `window-create` and `tab-create` both accept a new

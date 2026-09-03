@@ -63,7 +63,12 @@ EXAMPLE_PAYLOADS: dict[str, dict[str, Any]] = {
         "index": 0,
     },
     "group-list": {"profile": "default"},
-    "group-create": {"profile": "default", "tab_ids": [1, 2], "title": "Research"},
+    "group-create": {
+        "profile": "default",
+        "tab_ids": [1, 2],
+        "window_id": 123,
+        "title": "Research",
+    },
     "group-update": {"profile": "default", "group_id": 1, "title": "Research"},
     "group-move": {"profile": "default", "group_id": 1, "window_id": 2},
     "group-add-tabs": {"profile": "default", "group_id": 1, "tab_ids": [3, 4]},
