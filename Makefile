@@ -11,11 +11,11 @@ test: ## Run the complete test suite
 	@uv run python -m pytest -v
 
 lint: ## Run linting and formatting verification
-	@uv run ruff check src tests
-	@uv run ruff format --check src tests
+	@ruff check src tests
+	@ruff format --check src tests
 
 typecheck: ## Run strict static type checks
-	@uv run pyright
+	@pyright --pythonpath .venv/bin/python
 
 smoke: ## Start an isolated daemon and prove a CLI Unix-socket roundtrip
 	@uv run browser-proxy --help

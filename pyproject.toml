@@ -12,16 +12,16 @@ license = { text = "MIT" }
 authors = [{ name = "KpihX", email = "kapoivha@gmail.com" }]
 dependencies = [
   "pydantic>=2.11,<3",
-  "rich>=14,<15",
+  "rich>=14",
   "typer>=0.16,<1",
-  "websockets>=15,<16",
+  "websockets>=15",
 ]
 
 [project.scripts]
 browser-proxy = "browser_proxy.cli:app"
 
 [dependency-groups]
-dev = ["pyright>=1.1.400", "pytest>=8.4", "ruff>=0.12"]
+dev = ["pytest>=8.4"]
 
 [tool.ruff]
 line-length = 100
